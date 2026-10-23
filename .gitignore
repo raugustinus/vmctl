@@ -1,0 +1,9 @@
+.build/
+bin/
+.swiftpm/
+.DS_Store
+
+# Retired experiments: built artifacts and signing material stay local
+experiments/console-smoke/console-smoke
+experiments/usb-passthrough/VMControlUSB.app/
+experiments/usb-passthrough/profile/
