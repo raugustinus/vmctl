@@ -170,3 +170,61 @@ or `invalid_image` naming arm64, and a guest that stops on its own while `runnin
 Verified live: the same command against the rebuilt daemon now fails immediately with
 the arm64 message instead of reporting `running`. The arm64 netinst boot itself is still
 untested at the time of writing.
+
+## Linux disk size flag (2026-10-23)
+
+`create --linux --disk <size>` sends a byte count; the daemon accepts whole MiB between
+1 GiB and 4 TiB (`invalid_disk_size` otherwise), sizes the sparse disk, and rejects an
+image larger than the chosen disk (`image_too_large`). macOS creates reject the field
+with `unsupported_option`. Because an older daemon ignores unknown request fields, the
+CLI stats `disk.img` after `created` and reports `daemon_upgrade_required` if the size
+differs. The integration test creates a 2 GiB VM and reads the size back, and rejects a
+missing value, `0G`, `20X`, `500M`, and a 3 GiB sparse image against a 2 GiB disk.
+Release build, signing and all 17 tests passed. The running daemon still predates the
+flag while a Debian install is in progress on `deb`; the `deb` disk occupied 1.4 GiB
+of host space during the install against its 64 GiB ceiling.
+
+## vmctl rm (2026-10-23)
+
+`rm <name>` deletes a stopped VM's private directory through the daemon and replies
+`removed`. It refuses with `busy` while that name is active in any phase other than
+`stopped` or while a machine object exists, never defaults the name (`vmctl rm` alone
+is a usage error), and maps an older daemon's `invalid_command` to
+`daemon_upgrade_required`. The integration test covers the busy refusal on a running VM,
+removal of a never-started VM and of the last active VM, the missing-name error, a
+repeat removal, and `list`/`status` afterwards. All 17 tests passed on the rebuilt,
+signed binaries. Not exercised live: the running daemon predates `rm` while a Debian
+install is in progress.
+
+## IP column in list (2026-10-23)
+
+`list` now prints `NAME\tSTATE\tIP`. The supervisor keeps the started VM's MAC in
+memory (`activeMAC`) so neither `list` nor `ip` reads config files; the column is the
+same `/var/db/dhcpd_leases` lookup as `ip` and shows `-` for stopped VMs and for a
+running VM without a readable unexpired lease. All four `list` assertions in the daemon
+tests were updated; the firmware-only Linux guest shows `-` while running, as expected
+since it never requests a lease. All 17 tests passed. A real lease in the column is
+untested until a Linux or macOS guest with networking is booted on the new daemon.
+
+## Lease lookup fix (2026-10-23)
+
+After the first real Debian install, `ip`/`list` reported 192.168.64.36 while the guest
+was on .37. `/var/db/dhcpd_leases` held two unexpired leases for the VM's MAC: the
+installer's client identified by bare MAC (`1,<mac>`), the installed dhcpcd by an
+RFC 4361 identifier (`ff,<IAID><DUID-LLT>`) ending in the MAC. The old parser matched
+only the bare form and walked the file oldest-first. The parser moved to
+`VMCore/Leases.swift`, recognises type 1, DUID-LLT and DUID-LL identifiers, refuses
+DUID-EN, and returns the unexpired lease with the latest expiry. Three unit tests use
+the real file excerpt and synthetic variants. 20 tests pass. The new daemon has not been
+restarted yet while `deb` is running, so the live column still shows .36 until then.
+
+## Linux default disk 20 GiB; first live rm (2026-10-24)
+
+The Linux default disk is now 20 GiB sparse (`linuxDiskSize`); macOS keeps 64 GiB
+(`macDiskSize`). The daemon test asserts the default by stat. 20 tests pass. Live on
+the new daemon: `stop deb` shut the installed Debian 13 guest down gracefully over
+ACPI, the old daemon exited on SIGTERM, and `rm deb` / `rm dev` each replied `removed`,
+leaving only `mac`. Earlier on 2026-10-23 the Debian arm64 netinst installed to the
+virtio disk via the console window, rebooted from disk, obtained a NAT lease, and
+accepted SSH on 192.168.64.37, so a real Linux guest boot and the console display are
+now verified; cloud-init consumption still is not.

@@ -1,17 +1,39 @@
-# Experimental USB passthrough
+# iPhone USB passthrough: what works and where Apple stops it
 
-macOS 27 host, a macOS VM, and a signed desktop app are required. This was built
-to try an iPhone with Xcode inside the guest. **That does not work on macOS 27:**
-the Virtualization framework rejects any device that advertises an isochronous
-endpoint in *any* of its USB configurations, and every iPhone carries one in its
-USB audio configuration even when that configuration is not selected. The failure
-is reported by `vmctl usb status` as "A USB passthrough device with isochronous
-endpoints is not supported." Devices without isochronous endpoints, such as
-storage and serial adapters, are the intended use. The framework also documents
-that USB hubs and USB 3 ports are unsupported. Apple decides which accessories can
-be assigned; our code cannot force an unsupported device.
+vmctl exists because of this experiment. The goal was the smallest possible macOS VM
+that could have an iPhone passed through over USB, so Xcode in the guest could pair
+with a phone. macOS 27 added USB passthrough to the Virtualization framework, and
+everything up to the hand-over works. The last step does not, and it is Apple's rule,
+not a bug anyone can fix from outside.
+
+**What works** (verified 2026-09-23 on a macOS 27 host with a profile-signed app):
+
+- Registering the daemon as an Accessory Access client with the
+  `com.apple.developer.accessory-access.usb` entitlement.
+- The system **Virtual Machine Accessories** menu-bar item appearing, listing the
+  iPhone, and the user assigning it to the app.
+- macOS handing the device to the daemon, which attaches an XHCI controller to the VM.
+
+**What fails:** creating the `VZUSBPassthroughDevice` for the iPhone. The framework
+rejects any device that advertises an isochronous endpoint in *any* of its USB
+configurations. Every iPhone carries one in its USB audio configuration, even when that
+configuration is not the active one, so every iPhone is rejected with "A USB passthrough
+device with isochronous endpoints is not supported." The framework also documents that
+USB hubs and USB 3 ports are unsupported. Apple decides which accessories can be assigned;
+no code on the host side can force an unsupported device through.
+
+**What is left:** devices without isochronous endpoints, such as storage and serial
+adapters, are what the API is for. That path is untested here, because the original
+need was the phone. The USB code was removed from the shipping daemon on 2026-09-24 and
+is kept under `experiments/usb-passthrough/` with the instructions below. The rest of
+this document is the original working notes.
 
 ## Signing and building
+
+The USB code is not part of the `vmctl` package any more. To rebuild it, copy
+`build-usb.sh` and `USBApp/Info.plist` from `experiments/usb-passthrough/` back to the
+package root beside the `Makefile`, and restore `USBPassthrough.swift` into
+`Sources/vmctld/`. The notes below are as written when it was live.
 
 The normal ad-hoc `make` build still works for lifecycle/console commands. USB uses
 a separate app bundle because Accessory Access requires an ordinary Dock-visible

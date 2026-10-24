@@ -25,11 +25,11 @@ final class USBPassthrough: NSObject, AAUSBAccessoryListener, @unchecked Sendabl
         if enabled { reply(Reply(value: status)); return }
         guard Console.hasDesktopSession, Thread.isMainThread,
               Bundle.main.bundleURL.pathExtension == "app" else {
-            throw Failure("usb_app_required", "Run the experimental VMControlUSB.app supervisor from your desktop session. See USB.md.")
+            throw Failure("usb_app_required", "Run the experimental VMControlUSB.app supervisor from your desktop session. See docs/USB-PASSTHROUGH.md.")
         }
         guard let task = SecTaskCreateFromSelf(nil),
               SecTaskCopyValueForEntitlement(task, "com.apple.developer.accessory-access.usb" as CFString, nil) as? Bool == true else {
-            throw Failure("usb_entitlement_required", "This build needs an Accessory Access signing profile. Build with build-usb.sh; see USB.md.")
+            throw Failure("usb_entitlement_required", "This build needs an Accessory Access signing profile. Build with build-usb.sh; see docs/USB-PASSTHROUGH.md.")
         }
         guard !machine.usbControllers.isEmpty else { throw Failure("usb_controller_missing", "Restart the VM with this version to add its USB controller.") }
         // Apple's sample registers with no criteria so the system menu offers every

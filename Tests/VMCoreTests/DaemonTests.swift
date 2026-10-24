@@ -59,7 +59,7 @@ final class DaemonTests: XCTestCase {
         XCTAssertTrue(daemon.isRunning)
         try Store.directory(try store.vm("dev"))
         XCTAssertEqual(symlink(dir.path, root.appendingPathComponent("vms/alias").path), 0)
-        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\ndev\tstopped\nmac\tstopped\n")
+        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\ndev\tstopped\t-\nmac\tstopped\t-\n")
         XCTAssertEqual(try client(["list", "mac"]).0, 1)
         var booted = Configuration(name: "mac", cpuCount: 4, memorySize: 8_589_934_592, macAddress: "02:00:00:00:00:01", installed: true)
         booted.guestMajorVersion = 27; booted.firstBootAvailable = false
@@ -145,14 +145,32 @@ final class DaemonTests: XCTestCase {
         }
         var config = try JSONDecoder().decode(Configuration.self, from: Store.read(dir.appendingPathComponent("config.json")))
         XCTAssertTrue(config.isLinux); XCTAssertTrue(config.installed); XCTAssertEqual(config.firstBootAvailable, true)
+        var defaultDisk = stat()
+        XCTAssertEqual(stat(dir.appendingPathComponent("disk.img").path, &defaultDisk), 0)
+        XCTAssertEqual(defaultDisk.st_size, 20 << 30) // Linux default; macOS keeps 64 GiB
         XCTAssertEqual(try client(["create", "lin", "--linux"]).0, 1) // never overwrite
-        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\nlin\tstopped\n")
+        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\tstopped\t-\n")
         XCTAssertEqual(try client(["start", "lin", "--iso", "/nonexistent/installer.iso"]).0, 1)
         let wrongArch = root.appendingPathComponent("debian-13.7.0-amd64-netinst.iso")
         try Data(count: 4096).write(to: wrongArch)
         let rejected = try client(["start", "lin", "--iso", wrongArch.path])
         XCTAssertEqual(rejected.0, 1); XCTAssertTrue(rejected.1.contains("arm64"), rejected.1)
         XCTAssertEqual(try client(["create", "lin2", "--linux", "--image", wrongArch.path]).0, 1)
+        XCTAssertEqual(try client(["create", "lin3", "--linux", "--disk"]).0, 1)
+        XCTAssertEqual(try client(["create", "lin3", "--linux", "--disk", "0G"]).0, 1)
+        XCTAssertEqual(try client(["create", "lin3", "--linux", "--disk", "20X"]).0, 1)
+        let tooSmall = try client(["create", "lin3", "--linux", "--disk", "500M"])
+        XCTAssertEqual(tooSmall.0, 1); XCTAssertTrue(tooSmall.1.contains("invalid_disk_size"), tooSmall.1)
+        XCTAssertEqual(try client(["create", "lin3", "--linux", "--disk", "2G"]).1, "created\n")
+        var diskInfo = stat()
+        XCTAssertEqual(stat(try store.existing("lin3").appendingPathComponent("disk.img").path, &diskInfo), 0)
+        XCTAssertEqual(diskInfo.st_size, 2 << 30)
+        let bigImage = root.appendingPathComponent("big.raw")
+        let bigHandle = try FileHandle(forWritingTo: { FileManager.default.createFile(atPath: bigImage.path, contents: nil); return bigImage }())
+        try bigHandle.truncate(atOffset: 3 << 30); try bigHandle.close()
+        let tooBig = try client(["create", "lin4", "--linux", "--image", bigImage.path, "--disk", "2G"])
+        XCTAssertEqual(tooBig.0, 1); XCTAssertTrue(tooBig.1.contains("image_too_large"), tooBig.1)
+        XCTAssertThrowsError(try store.existing("lin4"))
         XCTAssertEqual(try client(["start", "lin", "--ssh-key", key]).0, 1) // requires --user
         XCTAssertEqual(try client(["start", "lin", "--user", "dev", "--ssh-key", "ssh-ed25519 bogus"]).0, 1)
         XCTAssertEqual(try client(["start", "lin", "--user", "root", "--ssh-key", key]).0, 1)
@@ -165,8 +183,11 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(started.0, 0, started.1); XCTAssertEqual(started.1, "running\n")
         XCTAssertNoThrow(try Store.check(dir.appendingPathComponent("cloud-init.img")))
         XCTAssertEqual(try client(["status", "lin"]).1, "running\n")
+        let busy = try client(["rm", "lin"])
+        XCTAssertEqual(busy.0, 1); XCTAssertTrue(busy.1.contains("busy"), busy.1)
         XCTAssertEqual(try client(["start", "lin"]).1, "running\n")
-        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\nlin\trunning\n")
+        // A firmware-only guest never requests a lease, so the running row shows "-" rather than an address.
+        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\trunning\t-\nlin3\tstopped\t-\n")
         XCTAssertEqual(try client(["stop", "lin", "--force"]).1, "stopped\n")
         XCTAssertEqual(try client(["status", "lin"]).1, "stopped\n")
         config = try JSONDecoder().decode(Configuration.self, from: Store.read(dir.appendingPathComponent("config.json")))
@@ -175,8 +196,15 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(retry.0, 1); XCTAssertTrue(retry.1.contains("first_boot_required"), retry.1)
         XCTAssertEqual(try client(["start", "lin"]).1, "running\n") // plain boot from disk, no installer
         XCTAssertEqual(try client(["stop", "lin", "--force"]).1, "stopped\n")
+        XCTAssertEqual(try client(["rm"]).0, 1) // never defaults the name
+        XCTAssertEqual(try client(["rm", "lin3"]).1, "removed\n")
+        XCTAssertThrowsError(try store.existing("lin3"))
+        XCTAssertEqual(try client(["rm", "lin3"]).0, 1)
+        XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\tstopped\t-\n")
         let logs = try client(["logs", "lin"]).1
         XCTAssertTrue(logs.contains("linux_vm_created") && logs.contains("starting_with_provisioning") && logs.contains("forced_shutdown"), logs)
+        XCTAssertEqual(try client(["rm", "lin"]).1, "removed\n") // last active name, now stopped
+        XCTAssertEqual(try client(["status", "lin"]).0, 1)
         daemon.terminate(); daemon.waitUntilExit()
         XCTAssertEqual(daemon.terminationStatus, 0)
     }

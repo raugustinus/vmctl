@@ -10,11 +10,17 @@ import Darwin
 
 // All mutable supervisor and VZ state belongs to DispatchQueue.main.
 final class Supervisor: NSObject, VZVirtualMachineDelegate {
-    static let diskSize: off_t = 64 * 1024 * 1024 * 1024
+    /// Sparse ceilings. macOS installs need the larger one; Linux gets a modest default and `--disk`.
+    static let macDiskSize: off_t = 64 << 30
+    static let linuxDiskSize: off_t = 20 << 30
+    static let minimumDiskSize: off_t = 1 << 30
+    static let maximumDiskSize: off_t = 4 << 40
     let store: Store
     var machine: VZVirtualMachine?
     var installer: VZMacOSInstaller?
     var activeName: String?
+    /// MAC of the VM in `machine`, kept so `list` and `ip` never reread config files.
+    var activeMAC: String?
     var phase = "stopped"
     var stopReplies: [(Reply) -> Void] = []
     let shutdownWatch = ShutdownWatch()
@@ -143,11 +149,13 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 let directory = store.root.appendingPathComponent("vms")
                 try Store.check(directory, directory: true)
                 let names = try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted()
-                var rows = ["NAME\tSTATE"]
+                var rows = ["NAME\tSTATE\tIP"]
                 for name in names {
                     // Ignore unrelated entries and unsafe directories without following links.
                     guard (try? store.existing(name)) != nil else { continue }
-                    rows.append("\(name)\t\(activeName == name ? phase : "stopped")")
+                    let running = activeName == name && phase == "running"
+                    let ip = running ? activeMAC.flatMap(Self.leaseIP) ?? "-" : "-"
+                    rows.append("\(name)\t\(activeName == name ? phase : "stopped")\t\(ip)")
                 }
                 reply(Reply(value: rows.joined(separator: "\n")))
             case "start", "provision":
@@ -186,7 +194,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 // Consume before start: crashes/failures may have booted the guest. Never guess or retry provisioning.
                 saved.firstBootAvailable = false
                 try Store.write(JSONEncoder().encode(saved), to: configURL)
-                machine = vm; vm.delegate = self; activeName = request.name; phase = "starting"; lastFailure = nil
+                machine = vm; vm.delegate = self; activeName = request.name; activeMAC = saved.macAddress; phase = "starting"; lastFailure = nil
                 log(request.name, provisioning ? "starting_with_provisioning" : "starting")
                 let name = request.name // The completion does not retain the credential-bearing request.
                 let completion: (Error?) -> Void = { error in
@@ -226,6 +234,15 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                         })
                     } catch { log(request.name, "graceful_shutdown_unavailable", error); forceStop() }
                 } else { forceStop() }
+            case "rm":
+                let dir = try store.existing(request.name)
+                guard !(activeName == request.name && (machine != nil || phase != "stopped")) else {
+                    throw Failure("busy", "VM \(request.name) is \(phase); stop it before removing it.")
+                }
+                // The directory is the whole VM: identity, EFI/auxiliary stores, disk, seed and logs.
+                try FileManager.default.removeItem(at: dir)
+                if activeName == request.name { activeName = nil }
+                reply(Reply(value: "removed"))
             case "status":
                 // No disk/config/image reads. The private VM directory only establishes existence.
                 _ = try store.existing(request.name)
@@ -249,9 +266,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 if offset > 0, let newline = text.firstIndex(of: "\n") { text = String(text[text.index(after: newline)...]) }
                 reply(Reply(value: text.trimmingCharacters(in: .newlines)))
             case "ip":
-                guard activeName == request.name, phase == "running" else { throw Failure("not_running", "VM is not running.") }
-                let (_, config) = try saved(request.name)
-                guard let ip = Self.leaseIP(mac: config.macAddress) else { throw Failure("ip_unknown", "No unexpired NAT lease is readable for this VM. Guest networking may not be ready.") }
+                guard activeName == request.name, phase == "running", let mac = activeMAC else { throw Failure("not_running", "VM is not running.") }
+                guard let ip = Self.leaseIP(mac: mac) else { throw Failure("ip_unknown", "No unexpired NAT lease is readable for this VM. Guest networking may not be ready.") }
                 reply(Reply(value: ip))
             default: throw Failure("invalid_command", "Unknown command.")
             }
@@ -308,7 +324,18 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         try Store.directory(dir.appendingPathComponent("logs"))
         return dir
     }
-    static func createDisk(at url: URL, copying image: URL?) throws {
+    static func describe(_ bytes: off_t) -> String {
+        bytes % (1 << 30) == 0 ? "\(bytes >> 30) GiB" : "\(bytes >> 20) MiB"
+    }
+    /// The requested size is sparse: it caps what the guest can write and costs nothing until written.
+    static func diskSize(_ request: Request) throws -> off_t {
+        guard let requested = request.diskSize else { return linuxDiskSize }
+        guard requested % (1 << 20) == 0, requested >= UInt64(minimumDiskSize), requested <= UInt64(maximumDiskSize) else {
+            throw Failure("invalid_disk_size", "Disk size must be a whole number of MiB between \(describe(minimumDiskSize)) and \(describe(maximumDiskSize)).")
+        }
+        return off_t(requested)
+    }
+    static func createDisk(at url: URL, copying image: URL?, size: off_t = macDiskSize) throws {
         if let image {
             // Same-volume APFS copies are clones; otherwise this is a full copy on a background queue.
             try FileManager.default.copyItem(at: image, to: url)
@@ -319,17 +346,20 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         defer { close(disk) }
         var info = stat()
         guard fstat(disk, &info) == 0 else { throw systemFailure("stat disk") }
-        guard info.st_size <= diskSize else { throw Failure("image_too_large", "Disk images larger than 64 GiB are not supported.") }
-        guard info.st_size == diskSize || ftruncate(disk, diskSize) == 0 else { throw systemFailure("size disk") }
+        guard info.st_size <= size else { throw Failure("image_too_large", "Disk image is larger than the \(describe(size)) disk.") }
+        guard info.st_size == size || ftruncate(disk, size) == 0 else { throw systemFailure("size disk") }
     }
     func createLinux(_ request: Request, reply: @escaping (Reply) -> Void) throws {
+        let size = try Self.diskSize(request)
         let image = try Self.localFile(request.image, "invalid_image", "Disk image")
         if let image {
             let handle = try FileHandle(forReadingFrom: image)
             let magic = try handle.read(upToCount: 4) ?? Data(); try handle.close()
             guard magic != Data([0x51, 0x46, 0x49, 0xFB]) else { throw Failure("invalid_image", "qcow2 images are not supported; supply a raw disk image.") }
             var info = stat()
-            guard stat(image.path, &info) == 0, info.st_size <= Self.diskSize else { throw Failure("image_too_large", "Disk images larger than 64 GiB are not supported.") }
+            guard stat(image.path, &info) == 0, info.st_size <= size else {
+                throw Failure("image_too_large", "Disk image is larger than the \(Self.describe(size)) disk; pass a larger --disk.")
+            }
         }
         let dir = try reserveDirectory(request)
         activeName = request.name; phase = "installing"; log(request.name, "preparing_linux_vm")
@@ -348,7 +378,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         } catch { fail(error); throw error }
         let disk = dir.appendingPathComponent("disk.img")
         DispatchQueue.global().async {
-            let prepared = Result { try Self.createDisk(at: disk, copying: image) }
+            let prepared = Result { try Self.createDisk(at: disk, copying: image, size: size) }
             DispatchQueue.main.async {
                 do {
                     try prepared.get()
@@ -363,7 +393,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
     }
     func create(_ request: Request, reply: @escaping (Reply) -> Void) throws {
-        guard request.image == nil, request.installer == nil else { throw Failure("unsupported_option", "--image and --iso apply to Linux VMs only.") }
+        guard request.image == nil, request.installer == nil, request.diskSize == nil else { throw Failure("unsupported_option", "--image, --disk and --iso apply to Linux VMs only.") }
         guard let path = request.restore, path.hasPrefix("/") else { throw Failure("restore_required", "Use create [name] --restore /absolute/path/to/Apple.ipsw.") }
         let imageURL = URL(fileURLWithPath: path).standardizedFileURL
         var info = stat()
@@ -404,23 +434,5 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             }
         }
     }
-    static func leaseIP(mac: String) -> String? {
-        // macOS's bootpd lease database is an implementation detail, not a VZ API.
-        guard let leases = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else { return nil }
-        func normalized(_ s: String) -> String { s.split(separator: ":").map { String(Int($0, radix: 16) ?? -1) }.joined(separator: ":") }
-        for block in leases.components(separatedBy: "{").reversed() {
-            var fields: [String: String] = [:]
-            for line in block.components(separatedBy: .newlines) {
-                let pair = line.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1).map(String.init)
-                if pair.count == 2 { fields[pair[0]] = pair[1] }
-            }
-            guard let hw = fields["hw_address"]?.split(separator: ",").last,
-                  normalized(String(hw)) == normalized(mac), let ip = fields["ip_address"],
-                  let expiry = fields["lease"], let timestamp = UInt64(expiry.replacingOccurrences(of: "0x", with: ""), radix: expiry.hasPrefix("0x") ? 16 : 10),
-                  Double(timestamp) > Date().timeIntervalSince1970 else { continue }
-            var address = in_addr()
-            if inet_pton(AF_INET, ip, &address) == 1 { return ip }
-        }
-        return nil
-    }
+    static func leaseIP(mac: String) -> String? { Leases.ip(mac: mac) }
 }

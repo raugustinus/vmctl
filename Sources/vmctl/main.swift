@@ -6,13 +6,15 @@ func usage() {
     print("""
     Usage: vmctl <create|start|stop|status|ip|logs|console> [name]
            vmctl list
+           vmctl rm <name>
            vmctl create [name] --restore /path/to/Apple.ipsw
-           vmctl create [name] --linux [--image /path/to/raw-disk.img]
+           vmctl create [name] --linux [--image /path/to/raw-disk.img] [--disk <size>]
            vmctl start [name] [--iso /path/to/installer.iso]
            vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
            vmctl stop [name] --force
     create --restore installs a local Apple restore image; it may take a long time.
-    create --linux prepares an EFI Linux VM with a blank 64 GiB disk, or a copy of a raw image.
+    create --linux prepares an EFI Linux VM with a blank sparse disk, or a copy of a raw image.
+    --disk sets the Linux disk size: 40G, 512M, 1T (bare numbers are GiB). Default 20 GiB, sparse.
     start --iso attaches an installer ISO (Linux only) for this boot; install it from console.
     --user creates a user and enables SSH on first boot only (macOS 27+ host/guest, or Linux cloud-init).
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
@@ -21,6 +23,7 @@ func usage() {
     stop --force powers off immediately; unsaved guest data may be lost.
     logs prints the last ~24 KB of supervisor events. Errors are JSON on stderr.
     console opens a local window for a running VM; closing it keeps the VM running.
+    rm deletes a stopped VM's directory (disk, identity, logs); it cannot be undone.
     """)
 }
 func daemonConnection(_ store: Store) throws -> Int32 {
@@ -85,6 +88,18 @@ func readPublicKey(_ value: String) throws -> String {
     return line
 }
 func absolute(_ path: String) -> String { URL(fileURLWithPath: path).standardizedFileURL.path }
+/// Binary units: 20G, 20GiB, 512M, 1T; a bare number is GiB. The daemon enforces the allowed range.
+func parseSize(_ text: String) throws -> UInt64 {
+    let lowered = text.lowercased()
+    let units: [(String, UInt64)] = [("tib", 1 << 40), ("tb", 1 << 40), ("t", 1 << 40), ("gib", 1 << 30), ("gb", 1 << 30), ("g", 1 << 30),
+                                     ("mib", 1 << 20), ("mb", 1 << 20), ("m", 1 << 20)]
+    var digits = Substring(lowered), unit: UInt64 = 1 << 30
+    if let match = units.first(where: { lowered.hasSuffix($0.0) }) { digits = lowered.dropLast(match.0.count); unit = match.1 }
+    guard let count = UInt64(digits), count > 0, count <= UInt64.max / unit else {
+        throw Failure("usage", "--disk takes a size such as 20G, 512M or 1T; a bare number means GiB.")
+    }
+    return count * unit
+}
 umask(0o077)
 
 signal(SIGPIPE, SIG_IGN)
@@ -92,21 +107,32 @@ do {
     var args = Array(CommandLine.arguments.dropFirst())
     if args.isEmpty || args == ["--help"] || args == ["-h"] { usage(); exit(0) }
     let command = args.removeFirst()
-    guard ["create", "start", "stop", "status", "ip", "logs", "list", "console"].contains(command) else { throw Failure("usage", "Unknown command. Run vmctl --help.") }
+    guard ["create", "start", "stop", "status", "ip", "logs", "list", "console", "rm"].contains(command) else { throw Failure("usage", "Unknown command. Run vmctl --help.") }
     if command == "list", !args.isEmpty { throw Failure("usage", "Usage: vmctl list (no arguments).") }
     var name = "mac"
     if let first = args.first, !first.hasPrefix("--") { name = args.removeFirst() }
+    else if command == "rm" { throw Failure("usage", "Usage: vmctl rm <name>. The name is never defaulted for removal.") }
     try validateName(name)
-    var restore: String?, kind: String?, image: String?, installer: String?
+    var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?
     var provisioning: Provisioning?
     var forceStop = false
     switch command {
     case "create":
+        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>].")
         if args.count == 2, args[0] == "--restore" { restore = absolute(args[1]) }
-        else if args.first == "--linux", args.count == 1 || (args.count == 3 && args[1] == "--image") {
-            kind = "linux"
-            if args.count == 3 { image = absolute(args[2]) }
-        } else { throw Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img].") }
+        else if args.first == "--linux" {
+            kind = "linux"; args.removeFirst()
+            while !args.isEmpty {
+                let flag = args.removeFirst()
+                guard !args.isEmpty else { throw createUsage }
+                let value = args.removeFirst()
+                switch flag {
+                case "--image" where image == nil: image = absolute(value)
+                case "--disk" where diskSize == nil: diskSize = try parseSize(value)
+                default: throw createUsage
+                }
+            }
+        } else { throw createUsage }
     case "stop":
         if args == ["--force"] { forceStop = true } else if !args.isEmpty { throw Failure("usage", "Use vmctl stop [name] [--force].") }
     case "start":
@@ -142,14 +168,20 @@ do {
     let fd = try daemonConnection(store); defer { close(fd) }
     Wire.timeout(fd, seconds: command == "create" ? 86400 : 120)
     try Wire.send(Request(command: forceStop ? "force-stop" : (provisioning == nil ? command : "provision"), name: name,
-                          restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer), to: fd)
+                          restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer, diskSize: diskSize), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
+    let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your active VM, quit vmctld in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
-        let newer = provisioning != nil || forceStop || command == "list" || command == "console" || kind != nil || installer != nil
-        if newer, error.code == "invalid_command" || (kind != nil && error.code == "restore_required") {
-            throw Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your active VM, quit vmctld in Activity Monitor, then retry with the updated daemon.")
-        }
+        let newer = provisioning != nil || forceStop || ["list", "console", "rm"].contains(command) || kind != nil || installer != nil
+        if newer, error.code == "invalid_command" || (kind != nil && error.code == "restore_required") { throw upgrade }
         throw error
+    }
+    if let diskSize, response.value == "created" {
+        // A daemon without --disk support ignores the field and silently builds the default size.
+        var info = stat()
+        if stat(try store.vm(name).appendingPathComponent("disk.img").path, &info) == 0, info.st_size != off_t(diskSize) {
+            throw Failure(upgrade.code, "VM \(name) was created with the old daemon's default disk size. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
+        }
     }
 
     if let value = response.value, !value.isEmpty { print(value) }

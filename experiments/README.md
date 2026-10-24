@@ -6,10 +6,9 @@ here is built by the Makefile or referenced from `Sources/`.
 ## usb-passthrough
 
 The experimental USB accessory supervisor removed from the main package on
-2026-09-24. See `USB.md` for what was tried and why iPhone passthrough is not
-possible on macOS 27. Contents:
+2026-09-24. See `docs/USB-PASSTHROUGH.md` for what was tried, what works, and why
+iPhone passthrough is not possible on macOS 27. Contents:
 
-- `USB.md`: design notes, build instructions, and validation boundary.
 - `USBPassthrough.swift`: the retired `vmctld` source file (imports `AccessoryAccess`).
 - `build-usb.sh` and `USBApp/Info.plist`: the app-bundle build. The script expects
   to run from the package root beside the `Makefile`, `bin/`, and `vmctld.entitlements`;

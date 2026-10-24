@@ -1,10 +1,28 @@
 # vmctl
 
-A small Swift macOS VM supervisor for Apple Silicon, running macOS or Linux guests.
-One active local VM, named `mac` by default. No third-party packages, guest agent,
-TCP control port, or runtime dependency beyond macOS frameworks. The stored model
-includes a VM name, so multiple inactive named VMs can exist, but v1 permits only
-one running/installing VM at a time, whichever kind it is.
+I wanted the smallest possible way to run a macOS VM with an iPhone passed through
+over USB, so Xcode in the guest could talk to a phone. macOS 27 added USB passthrough
+to the Virtualization framework, so I built the supervisor and the Accessory Access
+hand-over, and all of it worked right up to the last step: the framework rejects any
+device with an isochronous endpoint in any of its USB configurations, and every
+iPhone has one in its USB audio configuration. Apple does not allow it, full stop.
+That dead end is written up in `docs/USB-PASSTHROUGH.md` for the next person who
+hits the same wall.
+
+What was left turned out to be useful on its own: a small Swift VM supervisor for
+Apple Silicon that runs macOS or Linux guests, with first-boot user provisioning for
+macOS and cloud-init for Linux. No third-party packages, guest agent, TCP control
+port, or runtime dependency beyond macOS frameworks. The daemon never spawns a
+command. The whole thing is small enough to read in one sitting, which was the point
+while debugging USB and is still the point now.
+
+Why not [Tart](https://tart.run)? Tart is the mature choice if you want OCI image
+distribution, CI integration and a large feature set. vmctl is for when you want a
+dependency-free supervisor you can audit in an afternoon.
+
+One active local VM, named `mac` by default. The stored model includes a VM name,
+so multiple inactive named VMs can exist, but v1 permits only one running or
+installing VM at a time, whichever kind it is.
 
 ## Build and use
 
@@ -107,14 +125,20 @@ as for macOS guests. Restart an older daemon before using these commands.
 ssh dev@"$(./bin/vmctl ip lin)"
 ```
 
-`create --linux` prepares a sparse 64 GiB disk, or copies the raw image into it and
-extends it to 64 GiB (cloud images grow their root filesystem on first boot). The
-copy is an instant APFS clone on the same volume. qcow2 images are rejected; convert
+`create --linux` prepares a sparse disk, or copies the raw image into it and extends
+it to the disk size (cloud images grow their root filesystem on first boot). The copy
+is an instant APFS clone on the same volume. The Linux disk defaults to 20 GiB;
+`--disk 40G` (also `512M`, `1T`, or a bare number of GiB) picks another size between
+1 GiB and 4 TiB, in whole MiB. The size is a ceiling the guest sees, not space taken: the file
+is sparse and grows only with what the guest writes, which `du -h` on `disk.img` shows.
+An image larger than the chosen disk is rejected. qcow2 images are rejected; convert
 them elsewhere. Names containing `amd64`, `x86_64` or `i386` are refused, because only
 arm64 guests boot here; an unbootable image otherwise shows up as `running` followed a
 second later by a `guest_powered_off` log event. Image and ISO paths must be absolute
-local regular files, and images no larger than 64 GiB. Resources default to 4 CPUs and 8 GiB, clamped to the host's
+local regular files. Resources default to 4 CPUs and 8 GiB, clamped to the host's
 allowed range. `created` means the disk is prepared, not that anything is installed.
+If `create --disk` reports `daemon_upgrade_required`, the running daemon predates the
+flag and built the default size; remove that VM directory, restart the daemon and retry.
 
 `--iso` attaches the installer as a read-only USB mass storage device for that boot
 only. `--user` on a Linux VM writes a cloud-init NoCloud seed (`cloud-init.img`, a
@@ -167,14 +191,23 @@ A client timeout reports uncertainty, not cancellation: query `status` afterward
 - `status`: reports `starting`, `running`, `stopping`, `installing`, `stopped`, or
   `error` from the daemon. It checks VM-directory existence but **never reads
   config, auxiliary storage, or the disk image**. Unknown names return an error.
-- `ip`: matches the persisted MAC against unexpired records in
-  `/var/db/dhcpd_leases`. This is best effort, because NAT exposes no public VZ
-  guest-address API on the deployment baseline. The lease file is an undocumented
-  host detail and may be missing/unreadable; then `ip_unknown` is returned. A lease
-  is not proof that SSH is ready or that the guest has not changed its address.
+- `ip`: matches the VM's MAC against unexpired records in `/var/db/dhcpd_leases`
+  and returns the one with the latest expiry. A guest often holds two leases: the
+  installer's DHCP client identifies by bare MAC, the installed system's client
+  (dhcpcd, systemd-networkd) by an RFC 4361 identifier whose DUID-LLT or DUID-LL
+  ends in the MAC; both forms are recognised. A DUID-EN identifier (systemd-networkd
+  with its default `DUIDType=vendor`) contains no MAC and cannot be matched. This is
+  best effort, because NAT exposes no public VZ guest-address API on the deployment
+  baseline. The lease file is an undocumented host detail and may be missing or
+  unreadable; then `ip_unknown` is returned. A lease is not proof that SSH is ready
+  or that the guest has not changed its address.
 - `logs`: returns approximately the last 24 KiB of `logs/daemon.jsonl`, containing
   timestamped lifecycle events and framework failures. It is not guest console
   output and does not stream. Log rotation is not implemented.
+- `rm <name>`: deletes a stopped VM's directory, which is the whole VM: identity,
+  firmware/auxiliary stores, disk image, cloud-init seed and logs. It refuses with
+  `busy` while that VM is starting, running, stopping, installing or in `error`,
+  never defaults the name, and cannot be undone. Nothing else needs cleaning up.
 
 `create` reserves the directory without overwriting an existing VM, writes the
 Mac identity and a configuration marked `installed: false`, creates auxiliary
@@ -315,13 +348,16 @@ start and stop a firmware-only VM under a temporary `VMCTL_HOME`.
 
 ```sh
 ./bin/vmctl list
-# NAME    STATE
-# dev     running
-# mac     stopped
+# NAME    STATE     IP
+# dev     running   192.168.64.3
+# mac     stopped   -
 ```
 
 Names are sorted alphabetically. States come from the supervisor, just like
-`status`; listing never opens config files or disk images. An empty store prints
+`status`; listing never opens config files or disk images. The IP column is the
+same best-effort NAT lease lookup as `ip`, using the MAC the supervisor kept in
+memory when it started the VM; it shows `-` for every VM that is not running and
+for a running VM with no readable unexpired lease yet. An empty store prints
 only the header. Only private, user-owned VM directories with valid names are
 listed; symlinks and unrelated entries are ignored. A saved directory can represent
 an incomplete installation, so `stopped` does not imply it is bootable.
@@ -396,8 +432,10 @@ An older running daemon must be restarted to understand this option.
 
 ## USB passthrough
 
-The experimental accessory supervisor has been removed. Normal lifecycle and
-console operation use vmctld directly and require no USB provisioning profile.
+Not in the shipping daemon. The attempt, what worked, and the Apple restriction that
+ends it are in `docs/USB-PASSTHROUGH.md`; the retired code is under
+`experiments/usb-passthrough/`. Normal lifecycle and console operation use vmctld
+directly and require no USB provisioning profile.
 
 ## Repository layout
 
@@ -407,6 +445,11 @@ Makefile, vmctld.entitlements     # release build/test targets and daemon entitl
 bin/                              # signed binaries produced by make (gitignored)
 docs/VALIDATION.md                # record of what was tested and when
 docs/AGENT-ACCESS.md              # giving an AI agent SSH access without the private key
-experiments/                      # retired USB passthrough work and a console smoke test
-archive/patch-scripts/            # one-off edit scripts, already applied
+docs/USB-PASSTHROUGH.md           # the iPhone passthrough attempt and why Apple blocks it
+experiments/                      # retired USB passthrough code and a console smoke test
+LICENSE                           # BSD 3-Clause
 ```
+
+## License
+
+BSD 3-Clause. See `LICENSE`.
