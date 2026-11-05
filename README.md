@@ -24,43 +24,57 @@ One active local VM, named `mac` by default. The stored model includes a VM name
 so multiple inactive named VMs can exist, but v1 permits only one running or
 installing VM at a time, whichever kind it is.
 
-## Build and use
+## Install
 
 Requires an Apple Silicon Mac, macOS 13 or later, and Xcode or Command Line Tools
 with Swift and the macOS 27 SDK (Xcode 27+) to build. The daemon deliberately fails compilation for Intel.
 
+With Homebrew, which builds from source and ad-hoc signs on your machine:
+
+```sh
+brew install raugustinus/vmctl/vmctl
+```
+
+From a checkout:
+
 ```sh
 make
+sudo make install                    # or: make install PREFIX="$HOME/.local"
 ```
+
+Without installing, run `./bin/vmctl` in place of `vmctl` below.
+
+## Use
 
 Fastest path: a Debian cloud image, a key-only user created by cloud-init on first
 boot, SSH a few minutes later.
 
 ```sh
 curl -LO https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.raw
-./bin/vmctl create lin --linux --image "$PWD/debian-13-genericcloud-arm64.raw"
-./bin/vmctl start lin --user dev --ssh-key ~/.ssh/id_ed25519.pub
-./bin/vmctl list                     # the IP column fills once the guest has a lease
-ssh dev@"$(./bin/vmctl ip lin)"
-./bin/vmctl stop lin
+vmctl create lin --linux --image "$PWD/debian-13-genericcloud-arm64.raw"
+vmctl start lin --user dev --ssh-key ~/.ssh/id_ed25519.pub
+vmctl list                           # the IP column fills once the guest has a lease
+ssh dev@"$(vmctl ip lin)"
+vmctl stop lin
 ```
 
 Installing from an arm64 ISO through a console window is under "Linux guests" below.
 A macOS guest needs a local Apple restore image and a long install:
 
 ```sh
-./bin/vmctl create mac --restore /absolute/path/to/Apple.ipsw
-./bin/vmctl start mac
-./bin/vmctl status mac
-./bin/vmctl ip mac
-./bin/vmctl logs mac
-./bin/vmctl stop mac
+vmctl create mac --restore /absolute/path/to/Apple.ipsw
+vmctl start mac
+vmctl status mac
+vmctl ip mac
+vmctl logs mac
+vmctl stop mac
 ```
 
 `make` builds release binaries and ad-hoc signs them; `SIGN_IDENTITY=... make` uses a
 Developer ID instead. `make test` runs the suite and `make clean` removes `.build`
-and `bin`. Keep `vmctl` and `vmctld` next to each other, for example in a private
-user-owned `bin` directory. The Makefile selects SwiftPM's native engine for
+and `bin`. `make install` copies both signed binaries into `$(PREFIX)/bin`
+(default `/usr/local`; `make uninstall` removes them). Keep `vmctl` and `vmctld` next
+to each other; a symlink to `vmctl` elsewhere is fine. The Makefile selects SwiftPM's native engine for
 compatibility with older Swift tools and this environment (`BUILD_SYSTEM=` overrides
 it); Swift 6.4 warns that this engine is deprecated. It disables release debug
 symbols. No Homebrew, Go, Node, Python, or package downloads are used.
@@ -81,10 +95,10 @@ host and guest. Apple provides `VZMacGuestProvisioningOptions` for creating the
 initial account and enabling SSH without a console window.
 
 ```sh
-./bin/vmctl create dev --restore "$HOME/Downloads/UniversalMac_27.0_26A428_Restore.ipsw"
-./bin/vmctl start dev --user dev --full-name "Developer"
+vmctl create dev --restore "$HOME/Downloads/UniversalMac_27.0_26A428_Restore.ipsw"
+vmctl start dev --user dev --full-name "Developer"
 # Enter and confirm the guest password at the hidden terminal prompts.
-./bin/vmctl ip dev
+vmctl ip dev
 ssh dev@GUEST_IP
 ```
 
@@ -113,7 +127,7 @@ console below to enable it in guest System Settings.
 ### Upgrading an already running daemon
 
 Replacing the binary does not replace the running process. First stop your active
-VM with `./bin/vmctl stop mac`, then quit your `vmctld` process in Activity Monitor.
+VM with `vmctl stop mac`, then quit your `vmctld` process in Activity Monitor.
 The next CLI call starts the newly signed daemon. Do this **before** creating the
 new VM, so its first-boot eligibility and guest version are recorded. Your existing
 `mac` directory is preserved; use a new name such as `dev` for the new installation.
@@ -134,10 +148,10 @@ The cloud-image route is the quickstart above. The other route installs from an
 arm64 ISO through the local console window:
 
 ```sh
-./bin/vmctl create deb --linux
-./bin/vmctl start deb --iso "$HOME/Downloads/debian-13.7.0-arm64-netinst.iso"
-./bin/vmctl console deb          # install, create your user, tick "SSH server"
-./bin/vmctl start deb            # boots from disk; --iso is per boot, never stored
+vmctl create deb --linux
+vmctl start deb --iso "$HOME/Downloads/debian-13.7.0-arm64-netinst.iso"
+vmctl console deb    # install, create your user, tick "SSH server"
+vmctl start deb      # boots from disk; --iso is per boot, never stored
 ```
 
 `create --linux` prepares a sparse disk, or copies the raw image into it and extends
@@ -184,7 +198,7 @@ validation record are in `docs/DESIGN.md` and `docs/VALIDATION.md`.
 ## List saved VMs
 
 ```sh
-./bin/vmctl list
+vmctl list
 # NAME    STATE     IP
 # dev     running   192.168.64.3
 # mac     stopped   -
@@ -208,8 +222,8 @@ Restarting the VM supplies the new virtual keyboard and mouse devices. Do not
 repeat `--user` for an already-booted VM.
 
 ```sh
-./bin/vmctl start dev
-./bin/vmctl console dev
+vmctl start dev
+vmctl console dev
 ```
 
 `console` requires the named VM to be running. It opens (or brings forward) one
@@ -239,7 +253,7 @@ You can also complete Setup Assistant through this console on an older installat
 Then, on the **host**, connect using:
 
 ```sh
-open "vnc://$(./bin/vmctl ip dev)"
+open "vnc://$(vmctl ip dev)"
 ```
 
 After confirming the remote connection works, close the local console window.
@@ -259,7 +273,7 @@ If the guest does not shut down in response to the request, normal stop still wa
 for the grace period. For intentional immediate power-off instead:
 
 ```sh
-./bin/vmctl stop dev --force
+vmctl stop dev --force
 ```
 
 This bypasses graceful shutdown and can lose unsaved guest data. It also escalates
