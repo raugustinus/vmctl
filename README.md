@@ -190,8 +190,34 @@ private keys; `docs/AGENT-ACCESS.md` explains how that fits an AI-agent workflow
 `--ssh-key` and `--iso` are rejected for macOS VMs; `--restore` for Linux VMs.
 
 Graceful `stop` sends an ACPI power-button event; a guest that ignores it is forced
-off after 30 seconds. Shared folders, Rosetta, serial consoles and nested
-virtualization are not configured.
+off after 30 seconds. Shared folders, Rosetta and nested virtualization are not
+configured.
+
+### Direct kernel boot
+
+`--kernel` skips EFI and boots a Linux kernel directly, microVM style:
+
+```sh
+vmctl create tiny --linux --kernel "$PWD/Image" --initrd "$PWD/initrd" \
+  --image "$PWD/rootfs.ext4" --cpus 1 --memory 512M
+vmctl start tiny                     # returns in about a tenth of a second
+tail -f ~/.vmctl/vms/tiny/logs/console.log
+```
+
+The kernel must be an uncompressed arm64 `Image`. Virtualization does not decompress
+kernels, so gzip `vmlinuz` files (`gunzip -c vmlinuz > Image`) and EFI zboot images
+(Alpine, recent Ubuntu) are refused at create time with a hint. The kernel and initrd
+are copied into the VM directory, so the VM does not depend on the originals. The
+default command line is `console=hvc0 root=/dev/vda rw`, for an unpartitioned root
+filesystem on the disk; pass `--cmdline` to replace it entirely, for example
+`root=/dev/vda1` for a partitioned cloud image. A cloud-init seed from `--user`
+appears as `/dev/vdb`.
+
+A kernel-boot VM has no firmware, display, keyboard or pointer: only virtio disk,
+network, entropy and a virtio console (`hvc0`), whose output is appended to
+`logs/console.log`. `console` and `--iso` are refused. The console log is
+output-only and is not rotated. The boot mode, kernel and command line are fixed at
+create time.
 
 ## Design notes
 

@@ -80,10 +80,12 @@ removes its socket and PID file. It stays alive if shutdown fails.
     hardware-model       # macOS: VZMacHardwareModel.dataRepresentation
     machine-identifier   # VZMacMachineIdentifier or VZGenericMachineIdentifier data
     auxiliary-storage    # macOS: persistent Mac auxiliary storage
-    efi-variable-store   # Linux: persistent EFI variables, including boot order
+    efi-variable-store   # Linux EFI boot: persistent EFI variables, including boot order
+    kernel, initrd       # Linux --kernel boot: private copies; config.json holds the command line
     cloud-init.img       # Linux, after --user: NoCloud seed (password hash, public key)
     disk.img             # writable Virtio block image
     logs/daemon.jsonl
+    logs/console.log     # Linux --kernel boot: virtio console (hvc0) output, appended
 ```
 
 The Mac hardware model, machine identifier, auxiliary storage, disk, and MAC must
@@ -134,6 +136,9 @@ short enough for macOS's Unix socket pathname limit (103 UTF-8 bytes including
   `VZEFIVariableStore`, `VZUSBMassStorageDeviceConfiguration`,
   `VZVirtioGraphicsDeviceConfiguration`, `VZVirtioEntropyDeviceConfiguration`:
   Linux guests with EFI boot, per-boot installer ISOs, and a virtio display.
+- `VZLinuxBootLoader`, `VZVirtioConsoleDeviceSerialPortConfiguration`,
+  `VZFileSerialPortAttachment`: Linux direct kernel boot without firmware or display,
+  with the guest's `hvc0` written to a log file.
 
 Mac guests and installation require Apple Silicon and were introduced in macOS
 12. This package sets a macOS 13 host baseline; the core Mac APIs and forced stop

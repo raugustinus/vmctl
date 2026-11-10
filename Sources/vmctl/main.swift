@@ -9,6 +9,7 @@ func usage() {
            vmctl rm <name>
            vmctl create [name] --restore /path/to/Apple.ipsw
            vmctl create [name] --linux [--image /path/to/raw-disk.img] [--disk <size>] [--cpus <n>] [--memory <size>]
+                                [--kernel /path/to/Image [--initrd /path/to/initrd] [--cmdline "<args>"]]
            vmctl start [name] [--iso /path/to/installer.iso]
            vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
            vmctl stop [name] --force
@@ -16,6 +17,8 @@ func usage() {
     create --linux prepares an EFI Linux VM with a blank sparse disk, or a copy of a raw image.
     --disk sets the Linux disk size: 40G, 512M, 1T (bare numbers are GiB). Default 20 GiB, sparse.
     --cpus and --memory size a Linux VM, e.g. --cpus 1 --memory 512M (bare numbers are GiB). Default 4 CPUs, 8 GiB.
+    --kernel boots an uncompressed arm64 Image directly: no EFI, display or console window. Guest output
+    (hvc0) goes to ~/.vmctl/vms/<name>/logs/console.log. Default --cmdline: "\(KernelBoot.defaultCommandLine)".
     start --iso attaches an installer ISO (Linux only) for this boot; install it from console.
     --user creates a user and enables SSH on first boot only (macOS 27+ host/guest, or Linux cloud-init).
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
@@ -115,11 +118,12 @@ do {
     else if command == "rm" { throw Failure("usage", "Usage: vmctl rm <name>. The name is never defaulted for removal.") }
     try validateName(name)
     var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?, cpuCount: Int?, memorySize: UInt64?
+    var kernel: String?, initrd: String?, kernelCommandLine: String?
     var provisioning: Provisioning?
     var forceStop = false
     switch command {
     case "create":
-        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>] [--cpus <n>] [--memory <size>].")
+        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>] [--cpus <n>] [--memory <size>] [--kernel <Image> [--initrd <path>] [--cmdline <args>]].")
         if args.count == 2, args[0] == "--restore" { restore = absolute(args[1]) }
         else if args.first == "--linux" {
             kind = "linux"; args.removeFirst()
@@ -134,9 +138,14 @@ do {
                     guard let count = Int(value), count > 0 else { throw Failure("usage", "--cpus takes a positive whole number.") }
                     cpuCount = count
                 case "--memory" where memorySize == nil: memorySize = try parseSize(value, flag: "--memory")
+                case "--kernel" where kernel == nil: kernel = absolute(value)
+                case "--initrd" where initrd == nil: initrd = absolute(value)
+                case "--cmdline" where kernelCommandLine == nil: kernelCommandLine = value
                 default: throw createUsage
                 }
             }
+            if kernel == nil, initrd != nil || kernelCommandLine != nil { throw Failure("usage", "--initrd and --cmdline require --kernel.") }
+            if let kernelCommandLine { try KernelBoot.validate(commandLine: kernelCommandLine) }
         } else { throw createUsage }
     case "stop":
         if args == ["--force"] { forceStop = true } else if !args.isEmpty { throw Failure("usage", "Use vmctl stop [name] [--force].") }
@@ -174,7 +183,8 @@ do {
     Wire.timeout(fd, seconds: command == "create" ? 86400 : 120)
     try Wire.send(Request(command: forceStop ? "force-stop" : (provisioning == nil ? command : "provision"), name: name,
                           restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer, diskSize: diskSize,
-                          cpuCount: cpuCount, memorySize: memorySize), to: fd)
+                          cpuCount: cpuCount, memorySize: memorySize,
+                          kernel: kernel, initrd: initrd, kernelCommandLine: kernelCommandLine), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
     let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your active VM, quit vmctld in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
@@ -189,11 +199,11 @@ do {
             throw Failure(upgrade.code, "VM \(name) was created with the old daemon's default disk size. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
         }
     }
-    if cpuCount != nil || memorySize != nil, response.value == "created" {
-        // Likewise for --cpus/--memory: an older daemon drops the fields and writes its defaults.
+    if cpuCount != nil || memorySize != nil || kernel != nil, response.value == "created" {
+        // Likewise for --cpus/--memory/--kernel: an older daemon drops the fields and builds a default EFI VM.
         let saved = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.vm(name).appendingPathComponent("config.json")))
-        if cpuCount.map({ $0 != saved.cpuCount }) == true || memorySize.map({ $0 != saved.memorySize }) == true {
-            throw Failure(upgrade.code, "VM \(name) was created with the old daemon's default CPU or memory size. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
+        if cpuCount.map({ $0 != saved.cpuCount }) == true || memorySize.map({ $0 != saved.memorySize }) == true || (kernel != nil && !saved.bootsKernel) {
+            throw Failure(upgrade.code, "VM \(name) was created without the requested CPU, memory or kernel settings. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
         }
     }
 

@@ -70,12 +70,46 @@ public struct Request: Codable {
     public let cpuCount: Int?
     /// create --linux: memory in bytes; nil means the daemon default (8 GiB).
     public let memorySize: UInt64?
+    /// create --linux: absolute path of an uncompressed arm64 kernel Image; boots it directly instead of EFI.
+    public let kernel: String?
+    /// create --linux --kernel: absolute path of an initial ramdisk.
+    public let initrd: String?
+    /// create --linux --kernel: kernel command line; nil means `KernelBoot.defaultCommandLine`.
+    public let kernelCommandLine: String?
     public init(command: String, name: String, restore: String? = nil, provisioning: Provisioning? = nil,
                 kind: String? = nil, image: String? = nil, installer: String? = nil, diskSize: UInt64? = nil,
-                cpuCount: Int? = nil, memorySize: UInt64? = nil) {
+                cpuCount: Int? = nil, memorySize: UInt64? = nil,
+                kernel: String? = nil, initrd: String? = nil, kernelCommandLine: String? = nil) {
         self.command = command; self.name = name; self.restore = restore; self.provisioning = provisioning
         self.kind = kind; self.image = image; self.installer = installer; self.diskSize = diskSize
         self.cpuCount = cpuCount; self.memorySize = memorySize
+        self.kernel = kernel; self.initrd = initrd; self.kernelCommandLine = kernelCommandLine
+    }
+}
+/// Checks for Linux direct boot. Virtualization takes an uncompressed arm64 `Image` and does not
+/// decompress, so the common distro `vmlinuz` forms are named and refused rather than left to hang.
+public enum KernelBoot {
+    /// Unpartitioned root filesystem on the first disk, output on the virtio console.
+    public static let defaultCommandLine = "console=hvc0 root=/dev/vda rw"
+    public static let headerSize = 64
+    public static func validate(header: Data) throws {
+        let bytes = [UInt8](header.prefix(headerSize))
+        if bytes.starts(with: [0x1F, 0x8B]) {
+            throw Failure("invalid_kernel", "Kernel is gzip-compressed (a distro vmlinuz). Decompress it first: gunzip -c vmlinuz > Image.")
+        }
+        if bytes.count >= 8, bytes[0] == 0x4D, bytes[1] == 0x5A, Array(bytes[4..<8]) == Array("zimg".utf8) {
+            throw Failure("invalid_kernel", "Kernel is an EFI zboot compressed image, which only EFI firmware can unpack. Use an uncompressed arm64 Image, or boot this distro through EFI without --kernel.")
+        }
+        guard bytes.count == headerSize, Array(bytes[56..<60]) == [0x41, 0x52, 0x4D, 0x64] else {
+            throw Failure("invalid_kernel", "Not an arm64 Linux kernel Image (no ARM\\x64 magic at offset 56).")
+        }
+    }
+    public static func validate(commandLine: String) throws {
+        // arm64 COMMAND_LINE_SIZE is 2048 including the terminator.
+        guard !commandLine.trimmingCharacters(in: .whitespaces).isEmpty, commandLine.utf8.count < 2048,
+              !commandLine.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            throw Failure("invalid_cmdline", "Kernel command line must be nonempty, under 2048 bytes, without control characters.")
+        }
     }
 }
 public struct Reply: Codable {
@@ -92,9 +126,12 @@ public struct Configuration: Codable {
     public var guestMajorVersion: Int?
     public var firstBootAvailable: Bool?
     public var installed: Bool
-    /// "linux" for EFI generic-platform guests. Absent in configurations written before Linux support: macOS.
+    /// "linux" for generic-platform guests. Absent in configurations written before Linux support: macOS.
     public var kind: String?
     public var isLinux: Bool { kind == "linux" }
+    /// Set only for Linux VMs that boot `kernel` (and `initrd`, if present) directly instead of through EFI.
+    public var kernelCommandLine: String?
+    public var bootsKernel: Bool { isLinux && kernelCommandLine != nil }
     public init(name: String, cpuCount: Int, memorySize: UInt64, macAddress: String, installed: Bool) {
         self.name = name; self.cpuCount = cpuCount; self.memorySize = memorySize
         self.macAddress = macAddress; self.installed = installed

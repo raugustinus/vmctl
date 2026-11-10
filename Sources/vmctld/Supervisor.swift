@@ -79,11 +79,29 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             let platform = VZGenericPlatformConfiguration()
             platform.machineIdentifier = identity
             config.platform = platform
-            let variables = dir.appendingPathComponent("efi-variable-store")
-            try Store.check(variables)
-            let loader = VZEFIBootLoader()
-            loader.variableStore = VZEFIVariableStore(url: variables)
-            config.bootLoader = loader
+            if let commandLine = saved.kernelCommandLine {
+                // Direct boot: no firmware, display or input devices. The virtio console is the only output.
+                guard installer == nil else { throw Failure("unsupported_option", "--iso applies to EFI Linux VMs, not kernel-boot VMs.") }
+                let kernel = dir.appendingPathComponent("kernel")
+                try Store.check(kernel)
+                let loader = VZLinuxBootLoader(kernelURL: kernel)
+                let initrd = dir.appendingPathComponent("initrd")
+                var info = stat()
+                if lstat(initrd.path, &info) == 0 { try Store.check(initrd); loader.initialRamdiskURL = initrd }
+                loader.commandLine = commandLine
+                config.bootLoader = loader
+                let log = dir.appendingPathComponent("logs").appendingPathComponent("console.log")
+                if lstat(log.path, &info) == 0 { try Store.check(log) }
+                let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+                serial.attachment = try VZFileSerialPortAttachment(url: log, append: true)
+                config.serialPorts = [serial]
+            } else {
+                let variables = dir.appendingPathComponent("efi-variable-store")
+                try Store.check(variables)
+                let loader = VZEFIBootLoader()
+                loader.variableStore = VZEFIVariableStore(url: variables)
+                config.bootLoader = loader
+            }
             // A cloud-init seed written by provisioning stays attached; cloud-init keys off its instance-id.
             let seed = dir.appendingPathComponent("cloud-init.img")
             var info = stat()
@@ -95,9 +113,11 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 storage.append(VZUSBMassStorageDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: installer, readOnly: true)))
             }
             config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
-            let graphics = VZVirtioGraphicsDeviceConfiguration()
-            graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: Int(Console.initialSize.width), heightInPixels: Int(Console.initialSize.height))]
-            config.graphicsDevices = [graphics]
+            if !saved.bootsKernel {
+                let graphics = VZVirtioGraphicsDeviceConfiguration()
+                graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: Int(Console.initialSize.width), heightInPixels: Int(Console.initialSize.height))]
+                config.graphicsDevices = [graphics]
+            }
         } else {
             guard installer == nil else { throw Failure("unsupported_option", "--iso applies to Linux VMs only.") }
             guard let hardware = VZMacHardwareModel(dataRepresentation: try Store.read(dir.appendingPathComponent("hardware-model"))), hardware.isSupported,
@@ -123,9 +143,11 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         let network = VZVirtioNetworkDeviceConfiguration()
         network.macAddress = mac; network.attachment = VZNATNetworkDeviceAttachment()
         config.networkDevices = [network]
-        // The optional console attaches to this same VM and its input devices.
-        config.keyboards = [VZUSBKeyboardConfiguration()]
-        config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        if !saved.bootsKernel {
+            // The optional console attaches to this same VM and its input devices.
+            config.keyboards = [VZUSBKeyboardConfiguration()]
+            config.pointingDevices = [VZUSBScreenCoordinatePointingDeviceConfiguration()]
+        }
         try config.validate()
         return config
     }
@@ -139,6 +161,9 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             }
             switch request.command {
             case "console":
+                if (try? saved(request.name))?.1.bootsKernel == true {
+                    throw Failure("console_unavailable", "Kernel-boot VMs have no display. Guest console output (hvc0) is written to ~/.vmctl/vms/\(request.name)/logs/console.log.")
+                }
                 guard activeName == request.name, phase == "running", let vm = machine else {
                     throw Failure("not_running", "Start this VM before opening its console.")
                 }
@@ -387,22 +412,46 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 throw Failure("image_too_large", "Disk image is larger than the \(Self.describe(size)) disk; pass a larger --disk.")
             }
         }
+        let kernel = try Self.localFile(request.kernel, "invalid_kernel", "Kernel")
+        let initrd = try Self.localFile(request.initrd, "invalid_initrd", "Initial ramdisk")
+        guard kernel != nil || (initrd == nil && request.kernelCommandLine == nil) else {
+            throw Failure("unsupported_option", "--initrd and --cmdline require --kernel.")
+        }
+        if let kernel {
+            let handle = try FileHandle(forReadingFrom: kernel)
+            let header = try handle.read(upToCount: KernelBoot.headerSize) ?? Data(); try handle.close()
+            try KernelBoot.validate(header: header)
+            try KernelBoot.validate(commandLine: request.kernelCommandLine ?? KernelBoot.defaultCommandLine)
+        }
         let dir = try reserveDirectory(request)
-        activeName = request.name; phase = "installing"; log(request.name, "preparing_linux_vm")
+        activeName = request.name; phase = "installing"; log(request.name, kernel == nil ? "preparing_linux_vm" : "preparing_linux_kernel_vm")
         var saved: Configuration
         do {
             try Store.write(VZGenericMachineIdentifier().dataRepresentation, to: dir.appendingPathComponent("machine-identifier"))
-            let variables = dir.appendingPathComponent("efi-variable-store")
-            _ = try VZEFIVariableStore(creatingVariableStoreAt: variables, options: [])
-            guard chmod(variables.path, 0o600) == 0 else { throw systemFailure("chmod variable store") }
-            try Store.check(variables)
+            if kernel == nil {
+                let variables = dir.appendingPathComponent("efi-variable-store")
+                _ = try VZEFIVariableStore(creatingVariableStoreAt: variables, options: [])
+                guard chmod(variables.path, 0o600) == 0 else { throw systemFailure("chmod variable store") }
+                try Store.check(variables)
+            }
             saved = Configuration(name: request.name, cpuCount: cpus, memorySize: memory, macAddress: VZMACAddress.randomLocallyAdministered().string, installed: false)
             saved.kind = "linux"; saved.firstBootAvailable = true
+            if kernel != nil { saved.kernelCommandLine = request.kernelCommandLine ?? KernelBoot.defaultCommandLine }
             try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
         } catch { fail(error); throw error }
         let disk = dir.appendingPathComponent("disk.img")
         DispatchQueue.global().async {
-            let prepared = Result { try Self.createDisk(at: disk, copying: image, size: size) }
+            let prepared = Result {
+                // The VM keeps its own copies, so later edits to the originals never change what it boots.
+                for (source, file) in [(kernel, "kernel"), (initrd, "initrd")] {
+                    guard let source else { continue }
+                    let target = dir.appendingPathComponent(file)
+                    try FileManager.default.copyItem(at: source, to: target)
+                    guard chmod(target.path, 0o600) == 0 else { throw systemFailure("chmod \(file)") }
+                    try Store.check(target)
+                }
+                try Self.createDisk(at: disk, copying: image, size: size)
+            }
             DispatchQueue.main.async {
                 do {
                     try prepared.get()
@@ -417,8 +466,9 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
     }
     func create(_ request: Request, reply: @escaping (Reply) -> Void) throws {
-        guard request.image == nil, request.installer == nil, request.diskSize == nil, request.cpuCount == nil, request.memorySize == nil else {
-            throw Failure("unsupported_option", "--image, --disk, --cpus, --memory and --iso apply to Linux VMs only.")
+        guard request.image == nil, request.installer == nil, request.diskSize == nil, request.cpuCount == nil, request.memorySize == nil,
+              request.kernel == nil, request.initrd == nil, request.kernelCommandLine == nil else {
+            throw Failure("unsupported_option", "--image, --disk, --cpus, --memory, --kernel, --initrd, --cmdline and --iso apply to Linux VMs only.")
         }
         guard let path = request.restore, path.hasPrefix("/") else { throw Failure("restore_required", "Use create [name] --restore /absolute/path/to/Apple.ipsw.") }
         let imageURL = URL(fileURLWithPath: path).standardizedFileURL
