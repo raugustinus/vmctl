@@ -150,7 +150,8 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(defaultDisk.st_size, 20 << 30) // Linux default; macOS keeps 64 GiB
         XCTAssertEqual(try client(["create", "lin", "--linux"]).0, 1) // never overwrite
         XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\tstopped\t-\n")
-        XCTAssertEqual(try client(["start", "lin", "--iso", "/nonexistent/installer.iso"]).0, 1)
+        let missing = try client(["start", "lin", "--iso", "/nonexistent/installer.iso"])
+        XCTAssertEqual(missing.0, 1); XCTAssertTrue(missing.1.contains("not found"), missing.1)
         let wrongArch = root.appendingPathComponent("debian-13.7.0-amd64-netinst.iso")
         try Data(count: 4096).write(to: wrongArch)
         let rejected = try client(["start", "lin", "--iso", wrongArch.path])

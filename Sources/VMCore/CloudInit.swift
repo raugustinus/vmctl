@@ -22,10 +22,21 @@ public enum CloudInit {
     public static func metaData(instanceID: String, hostname: String) -> String {
         "instance-id: \(instanceID)\nlocal-hostname: \(hostname)\n"
     }
-    public static func seedImage(_ account: Provisioning, hostname: String) throws -> Data {
+    /// Network config v2 for the VM's one NIC: DHCP, identified by its MAC. systemd-networkd
+    /// otherwise sends a vendor DUID that contains no MAC, and the host's lease file then
+    /// cannot be matched to the VM (`vmctl ip` would find nothing).
+    public static func networkConfig(mac: String) throws -> String {
+        let config: [String: Any] = ["version": 2, "ethernets": ["primary": [
+            "match": ["macaddress": mac.lowercased()], "dhcp4": true, "dhcp-identifier": "mac"
+        ]]]
+        let json = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .withoutEscapingSlashes])
+        return String(decoding: json, as: UTF8.self) + "\n"
+    }
+    public static func seedImage(_ account: Provisioning, hostname: String, mac: String) throws -> Data {
         try FAT12.image(label: "CIDATA", files: [
             (name: "user-data", data: Data(try userData(account, hostname: hostname).utf8)),
-            (name: "meta-data", data: Data(metaData(instanceID: "vmctl-\(hostname)-\(UUID().uuidString.lowercased())", hostname: hostname).utf8))
+            (name: "meta-data", data: Data(metaData(instanceID: "vmctl-\(hostname)-\(UUID().uuidString.lowercased())", hostname: hostname).utf8)),
+            (name: "network-config", data: Data(try networkConfig(mac: mac).utf8))
         ])
     }
 

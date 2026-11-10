@@ -95,7 +95,10 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         guard path.hasPrefix("/") else { throw Failure(code, "\(what) path must be absolute.") }
         let url = URL(fileURLWithPath: path).standardizedFileURL
         var info = stat()
-        guard lstat(url.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw Failure(code, "\(what) must be a local regular file, not a symlink.") }
+        guard lstat(url.path, &info) == 0 else {
+            throw errno == ENOENT ? Failure(code, "\(what) not found: \(url.path)") : systemFailure("stat \(url.lastPathComponent)")
+        }
+        guard info.st_mode & S_IFMT == S_IFREG else { throw Failure(code, "\(what) must be a local regular file, not a symlink.") }
         // Apple Silicon boots only arm64 guests. Catch the common wrong download by name instead of a silent firmware halt.
         let lowered = url.lastPathComponent.lowercased()
         guard !["amd64", "x86_64", "x86-64", "i386", "i686"].contains(where: { lowered.contains($0) }) else {
@@ -222,7 +225,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                     // Ignore unrelated entries and unsafe directories without following links.
                     guard (try? store.existing(name)) != nil else { continue }
                     let session = sessions[name]
-                    let ip = session?.phase == "running" ? session?.mac.flatMap(Self.leaseIP) ?? "-" : "-"
+                    let ip = session?.phase == "running" ? session?.mac.flatMap { Self.leaseIP(mac: $0, name: name) } ?? "-" : "-"
                     rows.append("\(name)\t\(session?.phase ?? "stopped")\t\(ip)")
                 }
                 reply(Reply(value: rows.joined(separator: "\n")))
@@ -243,7 +246,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                     try validateProvisioningEligibility(saved)
                     if saved.isLinux {
                         // Only the password hash and the public key reach the seed.
-                        try Store.write(try CloudInit.seedImage(credentials, hostname: request.name), to: dir.appendingPathComponent("cloud-init.img"))
+                        try Store.write(try CloudInit.seedImage(credentials, hostname: request.name, mac: saved.macAddress), to: dir.appendingPathComponent("cloud-init.img"))
                     } else {
                         guard credentials.sshPublicKey == nil, let password = credentials.password else {
                             throw Failure("invalid_provisioning", "macOS guests are provisioned with a password only; --ssh-key applies to Linux VMs.")
@@ -338,7 +341,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 reply(Reply(value: text.trimmingCharacters(in: .newlines)))
             case "ip":
                 guard let current, current.phase == "running", let mac = current.mac else { throw Failure("not_running", "VM is not running.") }
-                guard let ip = Self.leaseIP(mac: mac) else { throw Failure("ip_unknown", "No unexpired NAT lease is readable for this VM. Guest networking may not be ready.") }
+                guard let ip = Self.leaseIP(mac: mac, name: request.name) else { throw Failure("ip_unknown", "No unexpired NAT lease is readable for this VM. Guest networking may not be ready.") }
                 reply(Reply(value: ip))
             default: throw Failure("invalid_command", "Unknown command.")
             }
@@ -562,5 +565,6 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             }
         }
     }
-    static func leaseIP(mac: String) -> String? { Leases.ip(mac: mac) }
+    /// Cloud-init sets the guest hostname to the VM name, which is what the name fallback relies on.
+    static func leaseIP(mac: String, name: String) -> String? { Leases.ip(mac: mac, hostname: name) }
 }

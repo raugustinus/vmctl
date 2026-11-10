@@ -44,7 +44,13 @@ A client timeout reports uncertainty, not cancellation: query `status` afterward
   installer's DHCP client identifies by bare MAC, the installed system's client
   (dhcpcd, systemd-networkd) by an RFC 4361 identifier whose DUID-LLT or DUID-LL
   ends in the MAC; both forms are recognised. A DUID-EN identifier (systemd-networkd
-  with its default `DUIDType=vendor`) contains no MAC and cannot be matched. This is
+  with its default `DUIDType=vendor`) contains no MAC. Two things cover it: the
+  cloud-init seed includes a `network-config` with `dhcp-identifier: mac`, so guests
+  provisioned with `--user` identify by MAC from first boot; and with no MAC match,
+  `ip` falls back to the newest unexpired lease whose recorded hostname is the VM name
+  and whose identifier carries no MAC at all. A same-named lease naming another MAC is
+  never taken. The fallback needs the guest's hostname to equal the VM name, which
+  cloud-init sets and an ISO install does only if you chose that name. This is
   best effort, because NAT exposes no public VZ guest-address API on the deployment
   baseline. The lease file is an undocumented host detail and may be missing or
   unreadable; then `ip_unknown` is returned. A lease is not proof that SSH is ready
@@ -88,7 +94,7 @@ removes its socket and PID file. It stays alive if shutdown fails.
     auxiliary-storage    # macOS: persistent Mac auxiliary storage
     efi-variable-store   # Linux EFI boot: persistent EFI variables, including boot order
     kernel, initrd       # Linux --kernel boot: private copies; config.json holds the command line
-    cloud-init.img       # Linux, after --user: NoCloud seed (password hash, public key)
+    cloud-init.img       # Linux, after --user: NoCloud seed (password hash, public key, network config)
     disk.img             # writable Virtio block image
     logs/daemon.jsonl
     logs/console.log     # Linux --kernel boot: virtio console (hvc0) output, appended

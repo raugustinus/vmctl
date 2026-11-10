@@ -56,6 +56,23 @@ final class LeasesTests: XCTestCase {
         XCTAssertNil(Leases.ip(mac: "AA:BB:CC:DD:EE:FF", in: en, now: now))
     }
 
+    func testHostnameFallbackOnlyForLeasesWithoutAMAC() {
+        // Verbatim shape of a Debian 13 cloud guest: systemd-networkd's DUID-EN, hostname set by cloud-init.
+        let unia = "{\n\tname=unia\n\tip_address=192.168.64.40\n\thw_address=ff,f1:f5:dd:7f:0:2:0:0:ab:11:66:ef:32:fb:e0:40:ad:f4\n\tlease=0x6adbc523\n}"
+        XCTAssertNil(Leases.ip(mac: "f6:12:32:ec:b2:f8", in: unia, now: now)) // no name given: MAC only
+        XCTAssertEqual(Leases.ip(mac: "f6:12:32:ec:b2:f8", hostname: "unia", in: unia, now: now), "192.168.64.40")
+        XCTAssertNil(Leases.ip(mac: "f6:12:32:ec:b2:f8", hostname: "other", in: unia, now: now))
+        // A MAC match always wins over a name match.
+        XCTAssertEqual(Leases.ip(mac: "86:5e:c9:f0:66:26", hostname: "debian-vm", in: Self.leases, now: now), "192.168.64.37")
+        // A same-named lease that names some other MAC belongs to another VM and is never taken.
+        let otherVM = "{\n\tname=unia\n\tip_address=192.168.64.41\n\thw_address=1,aa:bb:cc:dd:ee:ff\n\tlease=0x6adbc523\n}"
+        XCTAssertNil(Leases.ip(mac: "f6:12:32:ec:b2:f8", hostname: "unia", in: otherVM, now: now))
+        // Among name matches, the newest unexpired lease wins.
+        let older = unia.replacingOccurrences(of: "64.40", with: "64.30").replacingOccurrences(of: "0x6adbc523", with: "0x6adbc000")
+        XCTAssertEqual(Leases.ip(mac: "f6:12:32:ec:b2:f8", hostname: "unia", in: older + "\n" + unia, now: now), "192.168.64.40")
+        XCTAssertNil(Leases.ip(mac: "f6:12:32:ec:b2:f8", hostname: "unia", in: unia, now: Date(timeIntervalSince1970: 1_800_000_000)))
+    }
+
     func testIgnoresExpiredOtherAndMalformedEntries() {
         XCTAssertEqual(Leases.ip(mac: "06:bd:af:95:a3:03", in: Self.leases, now: Date(timeIntervalSince1970: 1_700_000_000)), "192.168.64.2")
         XCTAssertNil(Leases.ip(mac: "06:bd:af:95:a3:03", in: Self.leases, now: now)) // expired

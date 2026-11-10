@@ -7,30 +7,54 @@ import Darwin
 public enum Leases {
     public static let path = "/var/db/dhcpd_leases"
 
-    public static func ip(mac: String) -> String? {
+    public static func ip(mac: String, hostname: String? = nil) -> String? {
         guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
-        return ip(mac: mac, in: text, now: Date())
+        return ip(mac: mac, hostname: hostname, in: text, now: Date())
     }
 
     /// The unexpired lease with the latest expiry whose client identifies itself by this MAC.
     /// A guest commonly holds two: the installer's DHCP client sends the bare MAC, while the
     /// installed system's client (dhcpcd, systemd-networkd) sends an RFC 4361 identifier.
-    public static func ip(mac: String, in leases: String, now: Date) -> String? {
+    ///
+    /// Without a MAC match, falls back to the newest unexpired lease whose recorded client
+    /// name is `hostname` and whose identifier carries no MAC at all (DUID-EN, systemd-networkd's
+    /// default). A lease that names a different MAC is never taken, so another VM's lease cannot
+    /// be picked up because it shares the name.
+    public static func ip(mac: String, hostname: String? = nil, in leases: String, now: Date) -> String? {
         guard let wanted = bytes(mac), wanted.count == 6 else { return nil }
-        var best: (expiry: UInt64, ip: String)?
+        var byMAC: (expiry: UInt64, ip: String)?, byName: (expiry: UInt64, ip: String)?
         for block in leases.components(separatedBy: "{") {
             var fields: [String: String] = [:]
             for line in block.components(separatedBy: .newlines) {
                 let pair = line.trimmingCharacters(in: .whitespaces).split(separator: "=", maxSplits: 1).map(String.init)
                 if pair.count == 2 { fields[pair[0]] = pair[1] }
             }
-            guard let hw = fields["hw_address"], matches(hw, mac: wanted), let ip = fields["ip_address"],
+            guard let hw = fields["hw_address"], let ip = fields["ip_address"],
                   let expiry = fields["lease"].flatMap(number), Double(expiry) > now.timeIntervalSince1970 else { continue }
             var address = in_addr()
             guard inet_pton(AF_INET, ip, &address) == 1 else { continue }
-            if best.map({ expiry > $0.expiry }) ?? true { best = (expiry, ip) }
+            if matches(hw, mac: wanted) {
+                if byMAC.map({ expiry > $0.expiry }) ?? true { byMAC = (expiry, ip) }
+            } else if let hostname, fields["name"] == hostname, !carriesMAC(hw) {
+                if byName.map({ expiry > $0.expiry }) ?? true { byName = (expiry, ip) }
+            }
         }
-        return best?.ip
+        return (byMAC ?? byName)?.ip
+    }
+
+    /// True when the identifier names some link-layer address: a bare MAC, DUID-LLT or DUID-LL.
+    static func carriesMAC(_ hw: String) -> Bool {
+        let parts = hw.split(separator: ",", maxSplits: 1)
+        guard parts.count == 2, let type = UInt8(parts[0], radix: 16), let value = bytes(parts[1]) else { return true }
+        switch type {
+        case 1: return true
+        case 0xff:
+            let duid = value.dropFirst(4)
+            guard duid.count >= 2 else { return true }
+            let duidType = Int(duid[duid.startIndex]) << 8 | Int(duid[duid.startIndex + 1])
+            return duidType != 2
+        default: return true
+        }
     }
 
     static func number(_ text: String) -> UInt64? {

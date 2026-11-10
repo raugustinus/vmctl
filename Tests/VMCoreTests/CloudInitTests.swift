@@ -76,14 +76,16 @@ final class CloudInitTests: XCTestCase {
     }
 
     func testSeedImageIsAValidLabelledFAT12VolumeWithLongNames() throws {
-        let image = try CloudInit.seedImage(Provisioning(username: "dev", fullName: "Developer", password: "test-only-secret", sshPublicKey: Self.key), hostname: "lin")
+        let image = try CloudInit.seedImage(Provisioning(username: "dev", fullName: "Developer", password: "test-only-secret", sshPublicKey: Self.key), hostname: "lin", mac: "F6:12:32:EC:B2:F8")
         XCTAssertEqual(image.count, 1 << 20)
         XCTAssertEqual(Array(image[510..<512]), [0x55, 0xAA])
         XCTAssertEqual(String(decoding: image[43..<54], as: UTF8.self), "CIDATA     ")
         XCTAssertEqual(String(decoding: image[54..<62], as: UTF8.self), "FAT12   ")
         XCTAssertEqual(Self.fatEntry(image, 0), 0xFF8); XCTAssertEqual(Self.fatEntry(image, 1), 0xFFF)
         let entries = Self.rootEntries(image)
-        XCTAssertEqual(entries.map(\.name), ["CIDATA", "user-data", "meta-data"])
+        XCTAssertEqual(entries.map(\.name), ["CIDATA", "user-data", "meta-data", "network-config"])
+        XCTAssertEqual(String(decoding: Self.contents(image, entries[3]), as: UTF8.self),
+                       #"{"ethernets":{"primary":{"dhcp-identifier":"mac","dhcp4":true,"match":{"macaddress":"f6:12:32:ec:b2:f8"}}},"version":2}"# + "\n")
         XCTAssertEqual(entries[0].attributes, 0x08)
         let userData = String(decoding: Self.contents(image, entries[1]), as: UTF8.self)
         XCTAssertTrue(userData.hasPrefix("#cloud-config\n"))

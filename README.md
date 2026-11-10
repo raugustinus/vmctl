@@ -174,8 +174,9 @@ daemon and retry.
 
 `--iso` attaches the installer as a read-only USB mass storage device for that boot
 only. `--user` on a Linux VM writes a cloud-init NoCloud seed (`cloud-init.img`, a
-FAT12 volume labelled `CIDATA` holding `user-data` and `meta-data`) and attaches it
-read-only. The same first-boot rule as macOS provisioning applies, and it only has
+FAT12 volume labelled `CIDATA` holding `user-data`, `meta-data` and a `network-config`
+that makes the guest identify itself to DHCP by MAC, so `vmctl ip` can find it) and
+attaches it read-only. The same first-boot rule as macOS provisioning applies, and it only has
 an effect on images that run cloud-init, such as Debian, Ubuntu or Fedora cloud
 images. For ISO installs, create the user in the installer instead. Only the
 configured account is created, not the image's default user. It gets `/bin/bash`
