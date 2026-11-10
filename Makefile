@@ -7,6 +7,7 @@ BUILD_SYSTEM ?= native
 BUILD := .build
 PREFIX ?= /usr/local
 BINDIR ?= $(PREFIX)/bin
+ZSHDIR ?= $(PREFIX)/share/zsh/site-functions
 SWIFTFLAGS := --build-system $(BUILD_SYSTEM) --disable-sandbox -debug-info-format none
 export CLANG_MODULE_CACHE_PATH := $(CURDIR)/$(BUILD)/clang-cache
 export SWIFTPM_MODULECACHE_OVERRIDE := $(CURDIR)/$(BUILD)/module-cache
@@ -40,9 +41,11 @@ install:
 	mkdir -p "$(DESTDIR)$(BINDIR)"
 	install -m 755 bin/vmctld "$(DESTDIR)$(BINDIR)/vmctld"
 	install -m 755 bin/vmctl "$(DESTDIR)$(BINDIR)/vmctl"
+	mkdir -p "$(DESTDIR)$(ZSHDIR)"
+	install -m 644 completions/_vmctl "$(DESTDIR)$(ZSHDIR)/_vmctl"
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/vmctl" "$(DESTDIR)$(BINDIR)/vmctld"
+	rm -f "$(DESTDIR)$(BINDIR)/vmctl" "$(DESTDIR)$(BINDIR)/vmctld" "$(DESTDIR)$(ZSHDIR)/_vmctl"
 
 # Unit tests plus the daemon integration tests against the signed binaries.
 test: build

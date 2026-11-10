@@ -19,8 +19,26 @@ public struct Provisioning: Codable {
     public let password: String?
     /// Linux guests only: one OpenSSH public key line installed through cloud-init.
     public let sshPublicKey: String?
-    public init(username: String, fullName: String, password: String?, sshPublicKey: String? = nil) {
+    /// Linux guests only: a UTF-8 locale such as `en_US.UTF-8` for cloud-init to generate and set,
+    /// normally the host's own, so the `LC_*` variables macOS's ssh sends are valid in the guest.
+    public let locale: String?
+    public init(username: String, fullName: String, password: String?, sshPublicKey: String? = nil, locale: String? = nil) {
         self.username = username; self.fullName = fullName; self.password = password; self.sshPublicKey = sshPublicKey
+        self.locale = locale
+    }
+    /// The host locale from `LC_ALL`, `LC_CTYPE` or `LANG`, if it is a plain UTF-8 locale
+    /// cloud-init can generate. Anything else (`C`, `POSIX`, modifiers) yields nil.
+    public static func hostLocale(_ environment: [String: String]) -> String? {
+        for key in ["LC_ALL", "LC_CTYPE", "LANG"] {
+            guard let value = environment[key], !value.isEmpty else { continue }
+            return validLocale(value)
+        }
+        return nil
+    }
+    /// Normalises `en_US.utf8` and `en_US.UTF-8` to `en_US.UTF-8`; rejects anything else.
+    public static func validLocale(_ value: String) -> String? {
+        guard let match = value.wholeMatch(of: #/([a-z]{2,3}_[A-Z]{2})\.(?i:utf-?8)/#) else { return nil }
+        return "\(match.1).UTF-8"
     }
     public static let publicKeyTypes: Set<String> = ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
                                                      "ssh-rsa", "sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"]
@@ -39,6 +57,9 @@ public struct Provisioning: Codable {
             }
         }
         if let sshPublicKey { try Self.validatePublicKey(sshPublicKey) }
+        if let locale, Self.validLocale(locale) != locale {
+            throw Failure("invalid_provisioning", "Locale must look like en_US.UTF-8.")
+        }
     }
     /// Accepts one `type base64 [comment]` line whose wire blob names the same key type.
     public static func validatePublicKey(_ line: String) throws {
@@ -76,14 +97,33 @@ public struct Request: Codable {
     public let initrd: String?
     /// create --linux --kernel: kernel command line; nil means `KernelBoot.defaultCommandLine`.
     public let kernelCommandLine: String?
+    /// create --linux: absolute path of a host directory shared into the guest over virtiofs.
+    public let share: String?
+    /// create --linux --share DIR:ro: the guest may read but not write the shared directory.
+    public let shareReadOnly: Bool?
     public init(command: String, name: String, restore: String? = nil, provisioning: Provisioning? = nil,
                 kind: String? = nil, image: String? = nil, installer: String? = nil, diskSize: UInt64? = nil,
                 cpuCount: Int? = nil, memorySize: UInt64? = nil,
-                kernel: String? = nil, initrd: String? = nil, kernelCommandLine: String? = nil) {
+                kernel: String? = nil, initrd: String? = nil, kernelCommandLine: String? = nil,
+                share: String? = nil, shareReadOnly: Bool? = nil) {
         self.command = command; self.name = name; self.restore = restore; self.provisioning = provisioning
         self.kind = kind; self.image = image; self.installer = installer; self.diskSize = diskSize
         self.cpuCount = cpuCount; self.memorySize = memorySize
         self.kernel = kernel; self.initrd = initrd; self.kernelCommandLine = kernelCommandLine
+        self.share = share; self.shareReadOnly = shareReadOnly
+    }
+}
+/// One host directory shared into a Linux guest over virtiofs under a fixed tag. With cloud-init
+/// provisioning it is mounted at `~<user>/<directory name>`; otherwise `mount -t virtiofs vmctl <dir>`.
+public enum Share {
+    public static let tag = "vmctl"
+    /// The directory's own name, reduced to characters that are safe in a path and an fstab line.
+    public static func mountName(_ hostPath: String) -> String {
+        let base = URL(fileURLWithPath: hostPath).lastPathComponent
+        let safe = String(base.unicodeScalars.map {
+            CharacterSet.alphanumerics.contains($0) && $0.isASCII || "._-".unicodeScalars.contains($0) ? Character($0) : "_"
+        })
+        return safe.isEmpty || safe.hasPrefix(".") || safe == "/" ? "share" : safe
     }
 }
 /// Checks for Linux direct boot. Virtualization takes an uncompressed arm64 `Image` and does not
@@ -132,6 +172,9 @@ public struct Configuration: Codable {
     /// Set only for Linux VMs that boot `kernel` (and `initrd`, if present) directly instead of through EFI.
     public var kernelCommandLine: String?
     public var bootsKernel: Bool { isLinux && kernelCommandLine != nil }
+    /// Linux only: host directory attached over virtiofs at every boot, tagged `Share.tag`.
+    public var share: String?
+    public var shareReadOnly: Bool?
     public init(name: String, cpuCount: Int, memorySize: UInt64, macAddress: String, installed: Bool) {
         self.name = name; self.cpuCount = cpuCount; self.memorySize = memorySize
         self.macAddress = macAddress; self.installed = installed

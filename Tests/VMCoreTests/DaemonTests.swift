@@ -182,6 +182,27 @@ final class DaemonTests: XCTestCase {
         let smallConfig = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.existing("lin5").appendingPathComponent("config.json")))
         XCTAssertEqual(smallConfig.cpuCount, 1); XCTAssertEqual(smallConfig.memorySize, 512 << 20)
         XCTAssertEqual(try client(["rm", "lin5"]).1, "removed\n")
+        // --share: an existing directory only, stored with its read-only flag, and attached at boot.
+        let project = root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: false)
+        let missingShare = try client(["create", "lin7", "--linux", "--share", root.appendingPathComponent("nope").path])
+        XCTAssertEqual(missingShare.0, 1); XCTAssertTrue(missingShare.1.contains("not found"), missingShare.1)
+        let fileShare = try client(["create", "lin7", "--linux", "--share", wrongArch.path])
+        XCTAssertEqual(fileShare.0, 1); XCTAssertTrue(fileShare.1.contains("must be a directory"), fileShare.1)
+        let homeShare = try client(["create", "lin7", "--linux", "--share", NSHomeDirectory()])
+        XCTAssertEqual(homeShare.0, 1); XCTAssertTrue(homeShare.1.contains("whole home"), homeShare.1)
+        XCTAssertEqual(try client(["create", "lin7", "--restore", "/x.ipsw", "--share", project.path]).0, 1) // Linux only
+        XCTAssertThrowsError(try store.existing("lin7"))
+        XCTAssertEqual(try client(["create", "lin7", "--linux", "--share", project.path + ":ro"]).1, "created\n")
+        let shared = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.existing("lin7").appendingPathComponent("config.json")))
+        XCTAssertEqual(shared.share, project.standardizedFileURL.path); XCTAssertEqual(shared.shareReadOnly, true)
+        let sharedStart = try client(["start", "lin7"])
+        XCTAssertEqual(sharedStart.0, 0, sharedStart.1)
+        XCTAssertEqual(try client(["stop", "lin7", "--force"]).1, "stopped\n")
+        try FileManager.default.removeItem(at: project)
+        let movedShare = try client(["start", "lin7"]) // a moved or deleted project fails the start, not the guest mount
+        XCTAssertEqual(movedShare.0, 1); XCTAssertTrue(movedShare.1.contains("not found"), movedShare.1)
+        XCTAssertEqual(try client(["rm", "lin7"]).1, "removed\n")
         // Direct kernel boot: only the header is checked at create time.
         let kernelFile = root.appendingPathComponent("Image")
         try (KernelBootTests.imageHeader() + Data(count: 4096)).write(to: kernelFile)

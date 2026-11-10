@@ -44,6 +44,18 @@ sudo make install                    # or: make install PREFIX="$HOME/.local"
 
 Without installing, run `./bin/vmctl` in place of `vmctl` below.
 
+`make install` also installs zsh completion as `$(PREFIX)/share/zsh/site-functions/_vmctl`.
+zsh ships a `_vmctl` of its own, for OpenBSD's unrelated `vmctl`, and uses whichever it
+finds first in `$fpath`. The Homebrew and `/usr/local` site-functions directories come
+before zsh's own, so those installs just work. For `PREFIX="$HOME/.local"`, add this to
+`~/.zshrc` before `compinit` runs:
+
+```sh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+```
+
+Then run `rm -f ~/.zcompdump*` once, because zsh caches which `_vmctl` it picked.
+
 ## Use
 
 Fastest path: a Debian cloud image, a key-only user created by cloud-init on first
@@ -190,9 +202,39 @@ never the plaintext, and the public key. vmctl never generates, stores or reads
 private keys; `docs/AGENT-ACCESS.md` explains how that fits an AI-agent workflow.
 `--ssh-key` and `--iso` are rejected for macOS VMs; `--restore` for Linux VMs.
 
+The seed also generates your Mac's locale in the guest (from `LC_ALL`, `LC_CTYPE` or
+`LANG`, when it is a plain UTF-8 locale such as `en_US.UTF-8`). macOS's `ssh` sends
+those variables, so without it every login warns `cannot change locale`. It is done
+with `locale-gen` from `runcmd`, not cloud-init's `locale:` key, which fails the
+whole cloud-init run on Debian.
+
 Graceful `stop` sends an ACPI power-button event; a guest that ignores it is forced
-off after 30 seconds. Shared folders, Rosetta and nested virtualization are not
-configured.
+off after 30 seconds. Rosetta and nested virtualization are not configured.
+
+### Share a project directory
+
+```sh
+vmctl create proj --linux --image "$PWD/debian-13-genericcloud-arm64.raw" \
+  --cpus 2 --memory 4G --disk 10G --share ~/code/myproject
+vmctl start proj --user dev --ssh-key ~/.ssh/vm-proj.pub
+ssh dev@"$(vmctl ip proj)"           # ~/myproject is the host directory, live
+```
+
+`--share DIR` attaches one host directory over virtiofs at every boot; `DIR:ro` makes
+it read-only for the guest. With `start --user`, cloud-init mounts it at
+`~<user>/<directory name>` through an `/etc/fstab` entry (`nofail`, so a boot never
+waits on it), and gives the account your Mac's UID. virtiofs shows host owners'
+UIDs unchanged, so files in the share belong to the guest user and files the guest
+creates belong to you on the Mac. Without `--user`, mount it yourself:
+`sudo mount -t virtiofs vmctl /mnt`.
+
+The guest can read, change and delete everything in the shared directory, and
+nothing outside it. That is the point for an agent working on one project, and also
+the risk: commit or back up before letting anything loose in a read-write share. `/`
+and your home directory are refused. The share is fixed at create time and checked
+at every start, so a moved or deleted project directory makes `start` fail with
+`invalid_share` instead of booting without it. VMs created before `--share` have no
+share; create a new one, which takes seconds from the APFS-cloned image.
 
 ### Direct kernel boot
 
@@ -323,6 +365,7 @@ directly and require no USB provisioning profile.
 ```text
 Package.swift, Sources/, Tests/   # the SwiftPM package
 Makefile, vmctld.entitlements     # release build/test targets and daemon entitlements
+completions/_vmctl                # zsh completion, installed by make install
 bin/                              # signed binaries produced by make (gitignored)
 docs/DESIGN.md                    # architecture, storage, security, Apple APIs used
 docs/VALIDATION.md                # record of what was tested and when

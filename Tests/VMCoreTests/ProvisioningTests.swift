@@ -3,6 +3,24 @@ import Foundation
 @testable import VMCore
 
 final class ProvisioningTests: XCTestCase {
+    func testHostLocaleAndShareNames() throws {
+        XCTAssertEqual(Provisioning.hostLocale(["LANG": "en_US.UTF-8"]), "en_US.UTF-8")
+        XCTAssertEqual(Provisioning.hostLocale(["LC_ALL": "nl_NL.utf8", "LANG": "en_US.UTF-8"]), "nl_NL.UTF-8") // LC_ALL wins
+        XCTAssertEqual(Provisioning.hostLocale(["LC_CTYPE": "de_DE.UTF-8"]), "de_DE.UTF-8")
+        XCTAssertNil(Provisioning.hostLocale(["LANG": "C"]))
+        XCTAssertNil(Provisioning.hostLocale(["LC_ALL": "C.UTF-8", "LANG": "en_US.UTF-8"])) // the effective one is not generatable
+        XCTAssertNil(Provisioning.hostLocale([:]))
+        for bad in ["en_US.UTF-8; rm -rf /", "en_US.ISO-8859-1", "en_US.UTF-8@euro", "EN_us.UTF-8", "en_US"] {
+            XCTAssertNil(Provisioning.validLocale(bad), bad)
+        }
+        XCTAssertThrowsError(try Provisioning(username: "dev", fullName: "Dev", password: "secret", locale: "en_US.UTF-8'x").validate())
+        XCTAssertNoThrow(try Provisioning(username: "dev", fullName: "Dev", password: "secret", locale: "en_US.UTF-8").validate())
+        XCTAssertEqual(Share.mountName("/Users/rob/codefactoring/unia"), "unia")
+        XCTAssertEqual(Share.mountName("/Users/rob/My Project (old)"), "My_Project__old_")
+        XCTAssertEqual(Share.mountName("/Users/rob/.hidden"), "share")
+        XCTAssertEqual(Share.mountName("/Users/rob/café"), "cafe_") // decomposed: e + combining accent
+    }
+
     func testValidationAndWireRoundTrip() throws {
         let account = Provisioning(username: "dev", fullName: "Developer", password: "test-only-secret")
         try account.validate()

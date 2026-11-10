@@ -7,7 +7,13 @@ import CryptoKit
 public enum CloudInit {
     /// `#cloud-config` document. Emitted as JSON, which is valid YAML, so no scalar needs
     /// hand quoting. Only the configured account is created: no distro default user.
-    public static func userData(_ account: Provisioning, hostname: String) throws -> String {
+    /// A host directory to mount in the guest: its mount name and whether it is read-only, plus the
+    /// host UID. virtiofs shows the host owner's UID unchanged, so the guest user gets the same one.
+    public struct SeedShare {
+        public let name: String, readOnly: Bool, hostUID: Int
+        public init(name: String, readOnly: Bool, hostUID: Int) { self.name = name; self.readOnly = readOnly; self.hostUID = hostUID }
+    }
+    public static func userData(_ account: Provisioning, hostname: String, share: SeedShare? = nil) throws -> String {
         var user: [String: Any] = ["name": account.username, "gecos": account.fullName,
                                    "shell": "/bin/bash", "sudo": "ALL=(ALL) NOPASSWD:ALL"]
         if let password = account.password {
@@ -15,7 +21,29 @@ public enum CloudInit {
             user["passwd"] = sha512Crypt(password, salt: randomSalt())
         } else { user["lock_passwd"] = true }
         if let key = account.sshPublicKey { user["ssh_authorized_keys"] = [key] }
-        let config: [String: Any] = ["hostname": hostname, "users": [user], "ssh_pwauth": account.password != nil]
+        var config: [String: Any] = ["hostname": hostname, "users": [user], "ssh_pwauth": account.password != nil]
+        var runcmd: [Any] = []
+        if let locale = account.locale.flatMap(Provisioning.validLocale) {
+            // Not cloud-init's `locale:` key: on Debian it passes the name to locale-gen, which ignores
+            // arguments and builds only /etc/locale.gen, so update-locale then fails the whole run.
+            // Listing it there and passing it too works on Debian and Ubuntu; without locale-gen, skip.
+            // The locale is validated to [a-z_A-Z.UTF-8], so it is safe inside this shell line. runcmd entries
+            // share one script, so the subshell keeps `exit` from skipping the entries after it.
+            runcmd.append("(command -v locale-gen >/dev/null || exit 0; "
+                + "if [ -f /etc/locale.gen ] && ! grep -q '^\(locale) UTF-8' /etc/locale.gen; then echo '\(locale) UTF-8' >> /etc/locale.gen; fi; "
+                + "locale-gen \(locale))")
+        }
+        if let share {
+            user["uid"] = share.hostUID; config["users"] = [user]
+            let mountPoint = "/home/\(account.username)/\(share.name)"
+            // fstab mounts it on every later boot (nofail: a missing share never blocks boot);
+            // runcmd mounts it on this first boot, after the account and its home exist.
+            let options = share.readOnly ? "ro,nofail" : "rw,nofail"
+            config["write_files"] = [["path": "/etc/fstab", "append": true,
+                                      "content": "\(Share.tag) \(mountPoint) virtiofs \(options) 0 0\n"]]
+            runcmd += [["mkdir", "-p", mountPoint], ["mount", mountPoint]]
+        }
+        if !runcmd.isEmpty { config["runcmd"] = runcmd }
         let json = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .withoutEscapingSlashes])
         return "#cloud-config\n" + String(decoding: json, as: UTF8.self) + "\n"
     }
@@ -32,9 +60,9 @@ public enum CloudInit {
         let json = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .withoutEscapingSlashes])
         return String(decoding: json, as: UTF8.self) + "\n"
     }
-    public static func seedImage(_ account: Provisioning, hostname: String, mac: String) throws -> Data {
+    public static func seedImage(_ account: Provisioning, hostname: String, mac: String, share: SeedShare? = nil) throws -> Data {
         try FAT12.image(label: "CIDATA", files: [
-            (name: "user-data", data: Data(try userData(account, hostname: hostname).utf8)),
+            (name: "user-data", data: Data(try userData(account, hostname: hostname, share: share).utf8)),
             (name: "meta-data", data: Data(metaData(instanceID: "vmctl-\(hostname)-\(UUID().uuidString.lowercased())", hostname: hostname).utf8)),
             (name: "network-config", data: Data(try networkConfig(mac: mac).utf8))
         ])

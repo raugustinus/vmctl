@@ -10,6 +10,7 @@ func usage() {
            vmctl create [name] --restore /path/to/Apple.ipsw
            vmctl create [name] --linux [--image /path/to/raw-disk.img] [--disk <size>] [--cpus <n>] [--memory <size>]
                                 [--kernel /path/to/Image [--initrd /path/to/initrd] [--cmdline "<args>"]]
+                                [--share /path/to/project[:ro]]
            vmctl start [name] [--iso /path/to/installer.iso]
            vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
            vmctl stop [name] --force
@@ -19,6 +20,8 @@ func usage() {
     --cpus and --memory size a Linux VM, e.g. --cpus 1 --memory 512M (bare numbers are GiB). Default 4 CPUs, 8 GiB.
     --kernel boots an uncompressed arm64 Image directly: no EFI, display or console window. Guest output
     (hvc0) goes to ~/.vmctl/vms/<name>/logs/console.log. Default --cmdline: "\(KernelBoot.defaultCommandLine)".
+    --share attaches a host directory over virtiofs at every boot (:ro for read-only). With start --user it is
+    mounted at ~<user>/<directory name> in the guest; the guest can change everything in it, nothing outside.
     start --iso attaches an installer ISO (Linux only) for this boot; install it from console.
     --user creates a user and enables SSH on first boot only (macOS 27+ host/guest, or Linux cloud-init).
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
@@ -118,12 +121,12 @@ do {
     else if command == "rm" { throw Failure("usage", "Usage: vmctl rm <name>. The name is never defaulted for removal.") }
     try validateName(name)
     var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?, cpuCount: Int?, memorySize: UInt64?
-    var kernel: String?, initrd: String?, kernelCommandLine: String?
+    var kernel: String?, initrd: String?, kernelCommandLine: String?, share: String?, shareReadOnly: Bool?
     var provisioning: Provisioning?
     var forceStop = false
     switch command {
     case "create":
-        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>] [--cpus <n>] [--memory <size>] [--kernel <Image> [--initrd <path>] [--cmdline <args>]].")
+        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>] [--cpus <n>] [--memory <size>] [--kernel <Image> [--initrd <path>] [--cmdline <args>]] [--share <dir>[:ro]].")
         if args.count == 2, args[0] == "--restore" { restore = absolute(args[1]) }
         else if args.first == "--linux" {
             kind = "linux"; args.removeFirst()
@@ -141,6 +144,10 @@ do {
                 case "--kernel" where kernel == nil: kernel = absolute(value)
                 case "--initrd" where initrd == nil: initrd = absolute(value)
                 case "--cmdline" where kernelCommandLine == nil: kernelCommandLine = value
+                case "--share" where share == nil:
+                    let readOnly = value.hasSuffix(":ro")
+                    share = absolute(readOnly ? String(value.dropLast(3)) : value)
+                    if readOnly { shareReadOnly = true }
                 default: throw createUsage
                 }
             }
@@ -171,7 +178,10 @@ do {
                 password = try readPassword("New guest password: ")
                 guard password == (try readPassword("Confirm guest password: ")) else { throw Failure("password_mismatch", "Passwords did not match.") }
             }
-            provisioning = Provisioning(username: username, fullName: fullName ?? username, password: password, sshPublicKey: sshKey)
+            // Linux guests generate the host's locale, so the LC_* variables ssh sends from this Mac are valid
+            // there. macOS provisioning ignores it.
+            provisioning = Provisioning(username: username, fullName: fullName ?? username, password: password, sshPublicKey: sshKey,
+                                        locale: Provisioning.hostLocale(ProcessInfo.processInfo.environment))
             try provisioning!.validate()
         } else if fullName != nil || sshKey != nil { throw Failure("usage", "--full-name and --ssh-key require --user.") }
     default:
@@ -184,7 +194,8 @@ do {
     try Wire.send(Request(command: forceStop ? "force-stop" : (provisioning == nil ? command : "provision"), name: name,
                           restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer, diskSize: diskSize,
                           cpuCount: cpuCount, memorySize: memorySize,
-                          kernel: kernel, initrd: initrd, kernelCommandLine: kernelCommandLine), to: fd)
+                          kernel: kernel, initrd: initrd, kernelCommandLine: kernelCommandLine,
+                          share: share, shareReadOnly: shareReadOnly), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
     let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your running VMs, quit vmctld in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
@@ -199,11 +210,12 @@ do {
             throw Failure(upgrade.code, "VM \(name) was created with the old daemon's default disk size. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
         }
     }
-    if cpuCount != nil || memorySize != nil || kernel != nil, response.value == "created" {
-        // Likewise for --cpus/--memory/--kernel: an older daemon drops the fields and builds a default EFI VM.
+    if cpuCount != nil || memorySize != nil || kernel != nil || share != nil, response.value == "created" {
+        // Likewise for --cpus/--memory/--kernel/--share: an older daemon drops the fields and builds a default EFI VM.
         let saved = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.vm(name).appendingPathComponent("config.json")))
-        if cpuCount.map({ $0 != saved.cpuCount }) == true || memorySize.map({ $0 != saved.memorySize }) == true || (kernel != nil && !saved.bootsKernel) {
-            throw Failure(upgrade.code, "VM \(name) was created without the requested CPU, memory or kernel settings. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
+        if cpuCount.map({ $0 != saved.cpuCount }) == true || memorySize.map({ $0 != saved.memorySize }) == true
+            || (kernel != nil && !saved.bootsKernel) || (share != nil && saved.share == nil) {
+            throw Failure(upgrade.code, "VM \(name) was created without the requested CPU, memory, kernel or share settings. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
         }
     }
 

@@ -1,0 +1,57 @@
+#compdef vmctl
+# zsh completion for vmctl, the Apple Virtualization supervisor. zsh also ships a _vmctl for
+# OpenBSD's vmctl; this one wins when its directory comes earlier in $fpath, as the
+# site-functions directories of Homebrew and /usr/local do by default.
+
+_vmctl_names() {
+  local -a names
+  names=(${${(f)"$(_call_program vm-names vmctl list 2>/dev/null)"}[2,-1]%%$'\t'*})
+  _describe -t vm-names 'VM name' names
+}
+
+_vmctl() {
+  local curcontext=$curcontext state line
+  local -a commands
+  commands=(
+    'create:create a macOS or Linux VM'
+    'start:start a VM'
+    'stop:stop a VM'
+    'status:show the state of a VM'
+    'ip:print the address of a running VM'
+    'logs:print recent supervisor events'
+    'list:list VMs with state and address'
+    'console:open a console window for a running VM'
+    'rm:delete a stopped VM'
+  )
+  _arguments -C '1:command:->command' '*::argument:->argument' && return
+  case $state in
+    command) _describe -t commands 'vmctl command' commands ;;
+    argument)
+      case $words[1] in
+        create)
+          _arguments \
+            '1:new VM name:' \
+            '--restore[install a macOS restore image]:restore image:_files -g "*.ipsw(-.)"' \
+            '--linux[create a Linux VM]' \
+            '--image[raw disk image to copy]:raw disk image:_files' \
+            '--disk[disk size]:size:(8G 10G 20G 40G 100G)' \
+            '--cpus[virtual CPUs]:count:(1 2 4 6 8)' \
+            '--memory[memory size]:size:(512M 1G 2G 4G 8G 16G)' \
+            '--kernel[boot an uncompressed arm64 Image directly]:kernel Image:_files' \
+            '--initrd[initial ramdisk for --kernel]:initrd:_files' \
+            '--cmdline[kernel command line for --kernel]:command line:' \
+            '--share[host directory to share, :ro for read-only]:directory:_files -/' ;;
+        start)
+          _arguments \
+            '1:VM name:_vmctl_names' \
+            '--iso[installer ISO for this boot]:ISO image:_files -g "*.(iso|ISO)(-.)"' \
+            '--user[create this account on first boot]:account name:' \
+            '--full-name[full name for --user]:full name:' \
+            '--ssh-key[public key, or a .pub file]:public key:_files -g "*.pub(-.)"' ;;
+        stop) _arguments '1:VM name:_vmctl_names' '--force[power off immediately]' ;;
+        status|ip|logs|console|rm) _arguments '1:VM name:_vmctl_names' ;;
+      esac ;;
+  esac
+}
+
+_vmctl "$@"

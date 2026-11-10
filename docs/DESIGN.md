@@ -151,6 +151,8 @@ short enough for macOS's Unix socket pathname limit (103 UTF-8 bytes including
 - `VZLinuxBootLoader`, `VZVirtioConsoleDeviceSerialPortConfiguration`,
   `VZFileSerialPortAttachment`: Linux direct kernel boot without firmware or display,
   with the guest's `hvc0` written to a log file.
+- `VZVirtioFileSystemDeviceConfiguration`, `VZSingleDirectoryShare`, `VZSharedDirectory`:
+  one host directory per Linux VM over virtiofs, tag `vmctl`, optionally read-only.
 
 Mac guests and installation require Apple Silicon and were introduced in macOS
 12. This package sets a macOS 13 host baseline; the core Mac APIs and forced stop

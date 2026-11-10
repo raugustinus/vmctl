@@ -39,6 +39,35 @@ final class CloudInitTests: XCTestCase {
         XCTAssertEqual(CloudInit.metaData(instanceID: "iid-1", hostname: "lin"), "instance-id: iid-1\nlocal-hostname: lin\n")
     }
 
+    func testLocaleAndShareBecomeRuncmdAndFstab() throws {
+        func object(_ text: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.dropFirst("#cloud-config\n".count).utf8)) as? [String: Any])
+        }
+        // Neither: no runcmd, no uid, no write_files, and never cloud-init's own locale key.
+        let plain = try object(CloudInit.userData(Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key), hostname: "lin"))
+        XCTAssertNil(plain["runcmd"]); XCTAssertNil(plain["write_files"]); XCTAssertNil(plain["locale"])
+        XCTAssertNil((plain["users"] as? [[String: Any]])?.first?["uid"])
+
+        let account = Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key, locale: "en_US.UTF-8")
+        let share = CloudInit.SeedShare(name: "unia", readOnly: false, hostUID: 501)
+        let both = try object(CloudInit.userData(account, hostname: "lin", share: share))
+        XCTAssertNil(both["locale"])
+        XCTAssertEqual((both["users"] as? [[String: Any]])?.first?["uid"] as? Int, 501)
+        let files = try XCTUnwrap(both["write_files"] as? [[String: Any]])
+        XCTAssertEqual(files.first?["path"] as? String, "/etc/fstab"); XCTAssertEqual(files.first?["append"] as? Bool, true)
+        XCTAssertEqual(files.first?["content"] as? String, "vmctl /home/dev/unia virtiofs rw,nofail 0 0\n")
+        let runcmd = try XCTUnwrap(both["runcmd"] as? [Any])
+        XCTAssertEqual(runcmd.count, 3)
+        let localeStep = try XCTUnwrap(runcmd.first as? String)
+        XCTAssertTrue(localeStep.hasPrefix("(") && localeStep.hasSuffix(")"), localeStep) // a subshell: its exit skips nothing else
+        XCTAssertTrue(localeStep.contains("echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen") && localeStep.contains("locale-gen en_US.UTF-8"), localeStep)
+        XCTAssertEqual(runcmd[1] as? [String], ["mkdir", "-p", "/home/dev/unia"])
+        XCTAssertEqual(runcmd[2] as? [String], ["mount", "/home/dev/unia"])
+
+        let readOnly = try object(CloudInit.userData(account, hostname: "lin", share: CloudInit.SeedShare(name: "p", readOnly: true, hostUID: 501)))
+        XCTAssertEqual((readOnly["write_files"] as? [[String: Any]])?.first?["content"] as? String, "vmctl /home/dev/p virtiofs ro,nofail 0 0\n")
+    }
+
     // Minimal FAT12 reader used only to verify what the writer produced.
     struct Entry { let name: String; let cluster: Int; let size: Int; let attributes: UInt8 }
     static func rootEntries(_ image: Data) -> [Entry] {

@@ -106,6 +106,21 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
         return url
     }
+    /// A shared directory must be an existing local directory given by absolute path, not a symlink.
+    /// The guest sees and can change everything below it (unless read-only), and nothing outside it.
+    static func shareDirectory(_ path: String) throws -> URL {
+        guard path.hasPrefix("/") else { throw Failure("invalid_share", "Shared directory path must be absolute.") }
+        let url = URL(fileURLWithPath: path).standardizedFileURL
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else {
+            throw errno == ENOENT ? Failure("invalid_share", "Shared directory not found: \(url.path)") : systemFailure("stat \(url.lastPathComponent)")
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else { throw Failure("invalid_share", "Shared path must be a directory, not a file or symlink: \(url.path)") }
+        guard url.path != "/", url.path != FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path else {
+            throw Failure("invalid_share", "Share a project directory, not / or your whole home directory.")
+        }
+        return url
+    }
     func configuration(_ name: String, allowIncomplete: Bool = false, installer: URL? = nil) throws -> VZVirtualMachineConfiguration {
         let (dir, saved) = try saved(name)
         guard saved.version == 1, saved.name == name, saved.installed || allowIncomplete else {
@@ -158,6 +173,13 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 storage.append(VZUSBMassStorageDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: installer, readOnly: true)))
             }
             config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+            if let share = saved.share {
+                // Checked at every boot: a moved or deleted project directory fails the start, not the mount.
+                let directory = VZSharedDirectory(url: try Self.shareDirectory(share), readOnly: saved.shareReadOnly == true)
+                let device = VZVirtioFileSystemDeviceConfiguration(tag: Share.tag)
+                device.share = VZSingleDirectoryShare(directory: directory)
+                config.directorySharingDevices = [device]
+            }
             if !saved.bootsKernel {
                 let graphics = VZVirtioGraphicsDeviceConfiguration()
                 graphics.scanouts = [VZVirtioGraphicsScanoutConfiguration(widthInPixels: Int(Console.initialSize.width), heightInPixels: Int(Console.initialSize.height))]
@@ -246,7 +268,11 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                     try validateProvisioningEligibility(saved)
                     if saved.isLinux {
                         // Only the password hash and the public key reach the seed.
-                        try Store.write(try CloudInit.seedImage(credentials, hostname: request.name, mac: saved.macAddress), to: dir.appendingPathComponent("cloud-init.img"))
+                        let share = saved.share.map {
+                            CloudInit.SeedShare(name: Share.mountName($0), readOnly: saved.shareReadOnly == true, hostUID: Int(getuid()))
+                        }
+                        try Store.write(try CloudInit.seedImage(credentials, hostname: request.name, mac: saved.macAddress, share: share),
+                                        to: dir.appendingPathComponent("cloud-init.img"))
                     } else {
                         guard credentials.sshPublicKey == nil, let password = credentials.password else {
                             throw Failure("invalid_provisioning", "macOS guests are provisioned with a password only; --ssh-key applies to Linux VMs.")
@@ -469,6 +495,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
         let kernel = try Self.localFile(request.kernel, "invalid_kernel", "Kernel")
         let initrd = try Self.localFile(request.initrd, "invalid_initrd", "Initial ramdisk")
+        let share = try request.share.map { try Self.shareDirectory($0).path }
+        guard share != nil || request.shareReadOnly == nil else { throw Failure("unsupported_option", ":ro requires --share.") }
         guard kernel != nil || (initrd == nil && request.kernelCommandLine == nil) else {
             throw Failure("unsupported_option", "--initrd and --cmdline require --kernel.")
         }
@@ -492,6 +520,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             saved = Configuration(name: request.name, cpuCount: cpus, memorySize: memory, macAddress: VZMACAddress.randomLocallyAdministered().string, installed: false)
             saved.kind = "linux"; saved.firstBootAvailable = true
             if kernel != nil { saved.kernelCommandLine = request.kernelCommandLine ?? KernelBoot.defaultCommandLine }
+            if let share { saved.share = share; saved.shareReadOnly = request.shareReadOnly == true }
             try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
         } catch { fail(session, error); throw error }
         let disk = dir.appendingPathComponent("disk.img")
@@ -522,8 +551,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     }
     func create(_ request: Request, reply: @escaping (Reply) -> Void) throws {
         guard request.image == nil, request.installer == nil, request.diskSize == nil, request.cpuCount == nil, request.memorySize == nil,
-              request.kernel == nil, request.initrd == nil, request.kernelCommandLine == nil else {
-            throw Failure("unsupported_option", "--image, --disk, --cpus, --memory, --kernel, --initrd, --cmdline and --iso apply to Linux VMs only.")
+              request.kernel == nil, request.initrd == nil, request.kernelCommandLine == nil, request.share == nil else {
+            throw Failure("unsupported_option", "--image, --disk, --cpus, --memory, --kernel, --initrd, --cmdline, --share and --iso apply to Linux VMs only.")
         }
         guard let path = request.restore, path.hasPrefix("/") else { throw Failure("restore_required", "Use create [name] --restore /absolute/path/to/Apple.ipsw.") }
         let imageURL = URL(fileURLWithPath: path).standardizedFileURL
