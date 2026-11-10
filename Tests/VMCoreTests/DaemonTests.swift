@@ -229,6 +229,13 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(try client(["start", "lin"]).1, "running\n")
         // A firmware-only guest never requests a lease, so the running row shows "-" rather than an address.
         XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\trunning\t-\nlin3\tstopped\t-\n")
+        // Linux guests run side by side: a second start is not refused as busy, and each stops on its own.
+        let second = try client(["start", "lin3"])
+        XCTAssertEqual(second.0, 0, second.1); XCTAssertEqual(second.1, "running\n")
+        let busySecond = try client(["rm", "lin3"])
+        XCTAssertEqual(busySecond.0, 1); XCTAssertTrue(busySecond.1.contains("busy"), busySecond.1)
+        XCTAssertEqual(try client(["stop", "lin3", "--force"]).1, "stopped\n")
+        XCTAssertEqual(try client(["status", "lin3"]).1, "stopped\n")
         XCTAssertEqual(try client(["stop", "lin", "--force"]).1, "stopped\n")
         XCTAssertEqual(try client(["status", "lin"]).1, "stopped\n")
         config = try JSONDecoder().decode(Configuration.self, from: Store.read(dir.appendingPathComponent("config.json")))

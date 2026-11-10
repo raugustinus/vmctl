@@ -20,9 +20,9 @@ Why not [Tart](https://tart.run)? Tart is the mature choice if you want OCI imag
 distribution, CI integration and a large feature set. vmctl is for when you want a
 dependency-free supervisor you can audit in an afternoon.
 
-One active local VM, named `mac` by default. The stored model includes a VM name,
-so multiple inactive named VMs can exist, but v1 permits only one running or
-installing VM at a time, whichever kind it is.
+VMs are named, `mac` by default. Linux guests run side by side, and alongside one
+macOS guest; only one macOS guest runs or installs at a time. Each VM is sized at
+create time, so how many fit is up to you and the host's memory.
 
 ## Install
 

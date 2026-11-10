@@ -14,7 +14,13 @@ background process, not a system daemon or an installed launchd service. Automat
 restart, login startup, reboot persistence and VM resume are intentionally absent.
 Host sleep and logout are not promised uninterrupted guest uptime.
 
-The daemon strongly retains the `VZVirtualMachine`, its delegate, and installer.
+The daemon keeps one session per VM it has started or created, holding that VM's
+`VZVirtualMachine`, installer, phase, pending stop replies, shutdown timer and
+console window; it is the delegate for all of them. `busy` is per VM: Linux guests
+never block each other or a macOS guest, and a second macOS start or install is
+refused while one macOS guest is running or installing. On SIGTERM, SIGINT or SIGHUP
+the daemon stops every VM in parallel and exits once all have stopped; while any VM
+is installing or starting, it logs `daemon_exit_deferred` and stays up.
 All VZ access and lifecycle transitions occur on the main dispatch queue, which
 uses AppKit's main event loop in a logged-in desktop session (without a window
 until requested), or `dispatchMain()` when no desktop session is available. Socket accept/read/write work runs

@@ -66,18 +66,11 @@ do {
         signal(number, SIG_IGN)
         let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
         source.setEventHandler {
-            // Installation cannot safely be paused/stopped. Defer orderly daemon exit.
-            guard supervisor.phase != "installing", supervisor.phase != "starting" else {
-                if let name = supervisor.activeName { supervisor.log(name, "daemon_exit_deferred") }
-                return
-            }
-            let finish: (Reply) -> Void = { reply in
-                guard reply.error == nil else { return }
+            // Installation cannot safely be paused/stopped, so stopAll defers exit while any VM is
+            // installing or starting. Otherwise every VM stops before the daemon exits.
+            _ = supervisor.stopAll {
                 unlink(store.socketPath); unlink(pidURL.path); exit(0)
             }
-            if let name = supervisor.activeName, supervisor.machine != nil {
-                supervisor.handle(Request(command: "stop", name: name), reply: finish)
-            } else { finish(Reply(value: "stopped")) }
         }
         source.resume(); signalSources.append(source)
     }

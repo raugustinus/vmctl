@@ -5,6 +5,8 @@ import VMCore
 // Lives in the VM owner, on its main thread/queue. No VM crosses the IPC boundary.
 final class Console: NSObject, NSWindowDelegate {
     static let initialSize = NSSize(width: 1024, height: 768)
+    /// Console windows open across all VMs; the app leaves the Dock only when the last one closes.
+    private static var openWindows = 0
     private var window: NSWindow?
     private var view: VZVirtualMachineView?
 
@@ -49,6 +51,7 @@ final class Console: NSObject, NSWindowDelegate {
             view.capturesSystemKeys = false
             window.contentView = view
             self.window = window; self.view = view
+            Self.openWindows += 1
             window.center()
         }
         view?.virtualMachine = machine
@@ -65,7 +68,8 @@ final class Console: NSObject, NSWindowDelegate {
         view?.virtualMachine = nil
         window?.delegate = nil
         view = nil; window = nil
-        NSApplication.shared.setActivationPolicy(.accessory)
+        Self.openWindows -= 1
+        if Self.openWindows == 0 { NSApplication.shared.setActivationPolicy(.accessory) }
     }
 }
 

@@ -186,7 +186,7 @@ do {
                           cpuCount: cpuCount, memorySize: memorySize,
                           kernel: kernel, initrd: initrd, kernelCommandLine: kernelCommandLine), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
-    let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your active VM, quit vmctld in Activity Monitor, then retry with the updated daemon.")
+    let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your running VMs, quit vmctld in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
         let newer = provisioning != nil || forceStop || ["list", "console", "rm"].contains(command) || kind != nil || installer != nil
         if newer, error.code == "invalid_command" || (kind != nil && error.code == "restore_required") { throw upgrade }

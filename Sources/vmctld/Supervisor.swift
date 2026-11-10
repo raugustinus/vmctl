@@ -8,6 +8,26 @@ import Darwin
 #error("vmctld requires Apple Silicon")
 #endif
 
+/// Live state of one VM. A name without a session is stopped. Sessions stay until `rm`, so an
+/// `error` phase remains visible; `start` replaces any session that holds no machine.
+final class Session {
+    let name: String
+    let isMac: Bool
+    var machine: VZVirtualMachine?
+    var installer: VZMacOSInstaller?
+    /// MAC of `machine`, kept so `list` and `ip` never reread config files.
+    var mac: String?
+    var phase = "stopped"
+    var stopReplies: [(Reply) -> Void] = []
+    let shutdownWatch = ShutdownWatch()
+    var forceStopPending = false
+    var lastFailure: Failure?
+    let console = Console()
+    init(name: String, isMac: Bool) { self.name = name; self.isMac = isMac }
+    /// Owns a framework VM or an install that has not finished.
+    var isBusy: Bool { machine != nil || phase == "installing" }
+}
+
 // All mutable supervisor and VZ state belongs to DispatchQueue.main.
 final class Supervisor: NSObject, VZVirtualMachineDelegate {
     /// Sparse ceilings. macOS installs need the larger one; Linux gets a modest default and `--disk`.
@@ -16,18 +36,40 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     static let minimumDiskSize: off_t = 1 << 30
     static let maximumDiskSize: off_t = 4 << 40
     let store: Store
-    var machine: VZVirtualMachine?
-    var installer: VZMacOSInstaller?
-    var activeName: String?
-    /// MAC of the VM in `machine`, kept so `list` and `ip` never reread config files.
-    var activeMAC: String?
-    var phase = "stopped"
-    var stopReplies: [(Reply) -> Void] = []
-    let shutdownWatch = ShutdownWatch()
-    var forceStopPending = false
-    var lastFailure: Failure?
-    let console = Console()
+    /// Linux guests run side by side; at most one macOS guest runs or installs at a time.
+    var sessions: [String: Session] = [:]
     init(store: Store) { self.store = store }
+
+    func session(for machine: VZVirtualMachine) -> Session? {
+        sessions.values.first { $0.machine === machine }
+    }
+    /// Refuses a second macOS guest. Linux guests never block one another or a macOS guest.
+    func requireMacSlot(for name: String) throws {
+        if let other = sessions.values.first(where: { $0.isMac && $0.name != name && $0.isBusy }) {
+            throw Failure("busy", "macOS VM \(other.name) is \(other.phase); only one macOS guest runs at a time.")
+        }
+    }
+    /// Daemon exit: stops every VM, then calls `done` once all have stopped. Returns false, and stops
+    /// nothing, while any VM is installing or starting, since neither can be interrupted safely.
+    func stopAll(_ done: @escaping () -> Void) -> Bool {
+        let unsafe = sessions.values.filter { $0.phase == "installing" || $0.phase == "starting" }
+        guard unsafe.isEmpty else {
+            unsafe.forEach { log($0.name, "daemon_exit_deferred") }
+            return false
+        }
+        let running = sessions.values.filter { $0.machine != nil }
+        guard !running.isEmpty else { done(); return true }
+        var remaining = running.count, failed = false
+        for session in running {
+            handle(Request(command: "stop", name: session.name)) { reply in
+                // A VM that failed to stop keeps the daemon alive rather than orphaning it.
+                failed = failed || reply.error != nil
+                remaining -= 1
+                if remaining == 0, !failed { done() }
+            }
+        }
+        return true
+    }
 
     func log(_ name: String, _ event: String, _ error: Error? = nil) {
         do {
@@ -156,18 +198,19 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         do {
             try validateName(request.name)
             // Reconcile live framework state, never disk or network reachability.
-            if (phase == "running" || phase == "stopping"), machine?.state == .stopped {
-                finishStop()
+            for session in sessions.values where (session.phase == "running" || session.phase == "stopping") && session.machine?.state == .stopped {
+                finishStop(session)
             }
+            let current = sessions[request.name]
             switch request.command {
             case "console":
                 if (try? saved(request.name))?.1.bootsKernel == true {
                     throw Failure("console_unavailable", "Kernel-boot VMs have no display. Guest console output (hvc0) is written to ~/.vmctl/vms/\(request.name)/logs/console.log.")
                 }
-                guard activeName == request.name, phase == "running", let vm = machine else {
+                guard let current, current.phase == "running", let vm = current.machine else {
                     throw Failure("not_running", "Start this VM before opening its console.")
                 }
-                try console.show(vm, name: request.name)
+                try current.console.show(vm, name: request.name)
                 log(request.name, "console_opened")
                 reply(Reply(value: "console opened"))
             case "list":
@@ -178,17 +221,18 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 for name in names {
                     // Ignore unrelated entries and unsafe directories without following links.
                     guard (try? store.existing(name)) != nil else { continue }
-                    let running = activeName == name && phase == "running"
-                    let ip = running ? activeMAC.flatMap(Self.leaseIP) ?? "-" : "-"
-                    rows.append("\(name)\t\(activeName == name ? phase : "stopped")\t\(ip)")
+                    let session = sessions[name]
+                    let ip = session?.phase == "running" ? session?.mac.flatMap(Self.leaseIP) ?? "-" : "-"
+                    rows.append("\(name)\t\(session?.phase ?? "stopped")\t\(ip)")
                 }
                 reply(Reply(value: rows.joined(separator: "\n")))
             case "start", "provision":
                 let provisioning = request.command == "provision"
-                if !provisioning, activeName == request.name && phase == "running" { reply(Reply(value: "running")); return }
-                guard machine == nil, phase != "installing" else { throw Failure("busy", "VM \(activeName ?? "") is \(phase).") }
+                if !provisioning, current?.phase == "running" { reply(Reply(value: "running")); return }
+                if let current, current.isBusy { throw Failure("busy", "VM \(request.name) is \(current.phase).") }
                 let (dir, loaded) = try saved(request.name)
                 var saved = loaded
+                if !saved.isLinux { try requireMacSlot(for: request.name) }
                 let configURL = dir.appendingPathComponent("config.json")
                 let installer = try Self.localFile(request.installer, "invalid_installer", "Installer image")
                 guard installer == nil || saved.isLinux else { throw Failure("unsupported_option", "--iso applies to Linux VMs only.") }
@@ -219,15 +263,17 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 // Consume before start: crashes/failures may have booted the guest. Never guess or retry provisioning.
                 saved.firstBootAvailable = false
                 try Store.write(JSONEncoder().encode(saved), to: configURL)
-                machine = vm; vm.delegate = self; activeName = request.name; activeMAC = saved.macAddress; phase = "starting"; lastFailure = nil
+                let session = Session(name: request.name, isMac: !saved.isLinux)
+                sessions[request.name] = session
+                session.machine = vm; vm.delegate = self; session.mac = saved.macAddress; session.phase = "starting"
                 log(request.name, provisioning ? "starting_with_provisioning" : "starting")
                 let name = request.name // The completion does not retain the credential-bearing request.
                 let completion: (Error?) -> Void = { error in
                     if let error {
                         let safeError: Error = provisioning ? Failure("provisioning_start_failed", "VM start with provisioning failed. Restore a fresh VM before retrying provisioning.") : error
-                        self.fail(safeError); reply(Reply(error: Failure.wrapping(safeError)))
+                        self.fail(session, safeError); reply(Reply(error: Failure.wrapping(safeError)))
                     } else {
-                        self.phase = "running"; self.log(name, "running"); reply(Reply(value: "running"))
+                        session.phase = "running"; self.log(name, "running"); reply(Reply(value: "running"))
                     }
                 }
                 if saved.isLinux {
@@ -235,43 +281,43 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 } else { vm.start(options: options, completionHandler: completion) }
             case "stop", "force-stop":
                 _ = try store.existing(request.name)
-                if activeName != request.name || machine == nil { reply(Reply(value: "stopped")); return }
-                guard phase == "running" || phase == "stopping" else { throw Failure("busy", "Cannot stop while \(phase).") }
-                stopReplies.append(reply)
+                guard let current, current.machine != nil else { reply(Reply(value: "stopped")); return }
+                guard current.phase == "running" || current.phase == "stopping" else { throw Failure("busy", "Cannot stop while \(current.phase).") }
+                current.stopReplies.append(reply)
                 if request.command == "force-stop" {
-                    phase = "stopping"
-                    forceStop()
+                    current.phase = "stopping"
+                    forceStop(current)
                     return
                 }
-                if phase == "stopping" { return }
-                phase = "stopping"; log(request.name, "shutdown_requested")
-                if let vm = machine, vm.canRequestStop {
+                if current.phase == "stopping" { return }
+                current.phase = "stopping"; log(request.name, "shutdown_requested")
+                if let vm = current.machine, vm.canRequestStop {
                     do {
                         try vm.requestStop()
-                        shutdownWatch.start(on: .main, isStopped: { [weak vm] in
+                        current.shutdownWatch.start(on: .main, isStopped: { [weak vm] in
                             vm?.state == .stopped
-                        }, stopped: { [weak self, weak vm] in
-                            guard let self, let vm, self.machine === vm else { return }
-                            self.finishStop()
-                        }, timedOut: { [weak self, weak vm] in
-                            guard let self, let vm, self.machine === vm else { return }
-                            self.forceStop()
+                        }, stopped: { [weak self, weak current, weak vm] in
+                            guard let self, let current, let vm, current.machine === vm else { return }
+                            self.finishStop(current)
+                        }, timedOut: { [weak self, weak current, weak vm] in
+                            guard let self, let current, let vm, current.machine === vm else { return }
+                            self.forceStop(current)
                         })
-                    } catch { log(request.name, "graceful_shutdown_unavailable", error); forceStop() }
-                } else { forceStop() }
+                    } catch { log(request.name, "graceful_shutdown_unavailable", error); forceStop(current) }
+                } else { forceStop(current) }
             case "rm":
                 let dir = try store.existing(request.name)
-                guard !(activeName == request.name && (machine != nil || phase != "stopped")) else {
-                    throw Failure("busy", "VM \(request.name) is \(phase); stop it before removing it.")
+                if let current, current.machine != nil || current.phase != "stopped" {
+                    throw Failure("busy", "VM \(request.name) is \(current.phase); stop it before removing it.")
                 }
                 // The directory is the whole VM: identity, EFI/auxiliary stores, disk, seed and logs.
                 try FileManager.default.removeItem(at: dir)
-                if activeName == request.name { activeName = nil }
+                sessions[request.name] = nil
                 reply(Reply(value: "removed"))
             case "status":
                 // No disk/config/image reads. The private VM directory only establishes existence.
                 _ = try store.existing(request.name)
-                reply(Reply(value: activeName == request.name ? phase : "stopped"))
+                reply(Reply(value: current?.phase ?? "stopped"))
             case "create":
                 switch request.kind {
                 case nil: try create(request, reply: reply)
@@ -291,63 +337,69 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 if offset > 0, let newline = text.firstIndex(of: "\n") { text = String(text[text.index(after: newline)...]) }
                 reply(Reply(value: text.trimmingCharacters(in: .newlines)))
             case "ip":
-                guard activeName == request.name, phase == "running", let mac = activeMAC else { throw Failure("not_running", "VM is not running.") }
+                guard let current, current.phase == "running", let mac = current.mac else { throw Failure("not_running", "VM is not running.") }
                 guard let ip = Self.leaseIP(mac: mac) else { throw Failure("ip_unknown", "No unexpired NAT lease is readable for this VM. Guest networking may not be ready.") }
                 reply(Reply(value: ip))
             default: throw Failure("invalid_command", "Unknown command.")
             }
         } catch { reply(Reply(error: Failure.wrapping(error))) }
     }
-    func forceStop() {
-        shutdownWatch.cancel()
-        guard !forceStopPending else { return }
-        guard let vm = machine else { finishStop(); return }
-        if vm.state == .stopped { finishStop(); return }
-        guard vm.canStop else { finishStop(error: Failure("cannot_stop", "Framework cannot stop the VM in its current state; retry status/stop.")); return }
-        if let name = activeName { log(name, "forced_shutdown") }
-        forceStopPending = true
+    func forceStop(_ session: Session) {
+        session.shutdownWatch.cancel()
+        guard !session.forceStopPending else { return }
+        guard let vm = session.machine else { finishStop(session); return }
+        if vm.state == .stopped { finishStop(session); return }
+        guard vm.canStop else { finishStop(session, error: Failure("cannot_stop", "Framework cannot stop the VM in its current state; retry status/stop.")); return }
+        log(session.name, "forced_shutdown")
+        session.forceStopPending = true
         vm.stop { error in
-            guard self.machine === vm else { return }
-            self.finishStop(error: error)
+            guard session.machine === vm else { return }
+            self.finishStop(session, error: error)
         }
     }
-    func finishStop(error: Error? = nil) {
-        shutdownWatch.cancel()
-        forceStopPending = false
+    func finishStop(_ session: Session, error: Error? = nil) {
+        session.shutdownWatch.cancel()
+        session.forceStopPending = false
         if let error {
-            phase = machine?.state == .running ? "running" : "error"
-            if let name = activeName { log(name, "stop_failed", error) }
+            session.phase = session.machine?.state == .running ? "running" : "error"
+            log(session.name, "stop_failed", error)
         } else {
-            console.close()
-            phase = "stopped"; machine = nil
-            if let name = activeName { log(name, "stopped") }
+            session.console.close()
+            session.phase = "stopped"; session.machine = nil
+            log(session.name, "stopped")
         }
-        let pending = stopReplies; stopReplies.removeAll()
+        let pending = session.stopReplies; session.stopReplies.removeAll()
         pending.forEach { $0(Reply(value: error == nil ? "stopped" : nil, error: error.map(Failure.wrapping))) }
     }
-    func fail(_ error: Error) {
-        console.close()
-        lastFailure = Failure.wrapping(error)
-        if let name = activeName { log(name, "vm_failed", error) }
-        finishStop(error: error); machine = nil; phase = "error"
+    func fail(_ session: Session, _ error: Error) {
+        session.console.close()
+        session.lastFailure = Failure.wrapping(error)
+        log(session.name, "vm_failed", error)
+        finishStop(session, error: error); session.machine = nil; session.phase = "error"
     }
     func guestDidStop(_ virtualMachine: VZVirtualMachine) {
-        guard virtualMachine === machine, phase != "installing" else { return }
+        guard let session = session(for: virtualMachine), session.phase != "installing" else { return }
         // Not requested by us: the guest shut down, or the firmware halted with nothing bootable.
-        if phase == "running", let name = activeName { log(name, "guest_powered_off") }
-        finishStop()
+        if session.phase == "running" { log(session.name, "guest_powered_off") }
+        finishStop(session)
     }
     func virtualMachine(_ virtualMachine: VZVirtualMachine, didStopWithError error: Error) {
-        guard virtualMachine === machine, phase != "installing" else { return }; fail(error)
+        guard let session = session(for: virtualMachine), session.phase != "installing" else { return }
+        fail(session, error)
     }
     /// Exclusive creation of the VM directory; never overwrites an existing identity or disk.
-    func reserveDirectory(_ request: Request) throws -> URL {
+    /// Returns the new session, already in the `installing` phase.
+    func reserveDirectory(_ request: Request, isMac: Bool) throws -> (URL, Session) {
         guard VZVirtualMachine.isSupported else { throw Failure("unsupported_host", "Virtualization is unavailable on this host.") }
-        guard machine == nil, phase != "installing" else { throw Failure("busy", "Stop the active VM before installing.") }
+        if let current = sessions[request.name], current.isBusy { throw Failure("busy", "VM \(request.name) is \(current.phase).") }
+        if isMac { try requireMacSlot(for: request.name) }
         let dir = try store.vm(request.name)
         guard mkdir(dir.path, 0o700) == 0 else { throw systemFailure("create VM directory (must not already exist)") }
         try Store.directory(dir.appendingPathComponent("logs"))
-        return dir
+        let session = Session(name: request.name, isMac: isMac)
+        session.phase = "installing"
+        sessions[request.name] = session
+        return (dir, session)
     }
     static func describe(_ bytes: off_t) -> String {
         bytes % (1 << 30) == 0 ? "\(bytes >> 30) GiB" : "\(bytes >> 20) MiB"
@@ -423,8 +475,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             try KernelBoot.validate(header: header)
             try KernelBoot.validate(commandLine: request.kernelCommandLine ?? KernelBoot.defaultCommandLine)
         }
-        let dir = try reserveDirectory(request)
-        activeName = request.name; phase = "installing"; log(request.name, kernel == nil ? "preparing_linux_vm" : "preparing_linux_kernel_vm")
+        let (dir, session) = try reserveDirectory(request, isMac: false)
+        log(request.name, kernel == nil ? "preparing_linux_vm" : "preparing_linux_kernel_vm")
         var saved: Configuration
         do {
             try Store.write(VZGenericMachineIdentifier().dataRepresentation, to: dir.appendingPathComponent("machine-identifier"))
@@ -438,7 +490,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             saved.kind = "linux"; saved.firstBootAvailable = true
             if kernel != nil { saved.kernelCommandLine = request.kernelCommandLine ?? KernelBoot.defaultCommandLine }
             try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
-        } catch { fail(error); throw error }
+        } catch { fail(session, error); throw error }
         let disk = dir.appendingPathComponent("disk.img")
         DispatchQueue.global().async {
             let prepared = Result {
@@ -458,10 +510,10 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                     _ = try self.configuration(request.name, allowIncomplete: true)
                     saved.installed = true
                     try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
-                    self.machine = nil; self.phase = "stopped"
+                    session.machine = nil; session.phase = "stopped"
                     self.log(request.name, "linux_vm_created")
                     reply(Reply(value: "created"))
-                } catch { self.fail(error); reply(Reply(error: Failure.wrapping(error))) }
+                } catch { self.fail(session, error); reply(Reply(error: Failure.wrapping(error))) }
             }
         }
     }
@@ -474,8 +526,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         let imageURL = URL(fileURLWithPath: path).standardizedFileURL
         var info = stat()
         guard lstat(imageURL.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG else { throw Failure("invalid_restore", "Restore image must be a local regular file, not a symlink.") }
-        let dir = try reserveDirectory(request)
-        activeName = request.name; phase = "installing"; log(request.name, "loading_restore_image")
+        let (dir, session) = try reserveDirectory(request, isMac: true)
+        log(request.name, "loading_restore_image")
         VZMacOSRestoreImage.load(from: imageURL) { result in
             DispatchQueue.main.async {
                 do {
@@ -492,21 +544,21 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                     saved.firstBootAvailable = true
                     try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
                     let vm = VZVirtualMachine(configuration: try self.configuration(request.name, allowIncomplete: true))
-                    self.machine = vm; vm.delegate = self
+                    session.machine = vm; vm.delegate = self
                     let installer = VZMacOSInstaller(virtualMachine: vm, restoringFromImageAt: imageURL)
-                    self.installer = installer; self.log(request.name, "installation_started")
+                    session.installer = installer; self.log(request.name, "installation_started")
                     installer.install { result in
                         do {
                             try result.get(); saved.installed = true
                             try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
-                            self.installer = nil; self.machine = nil; self.phase = "stopped"
+                            session.installer = nil; session.machine = nil; session.phase = "stopped"
                             self.log(request.name, "installation_completed")
                             reply(Reply(value: "installed"))
                         } catch {
-                            self.installer = nil; self.fail(error); reply(Reply(error: Failure.wrapping(error)))
+                            session.installer = nil; self.fail(session, error); reply(Reply(error: Failure.wrapping(error)))
                         }
                     }
-                } catch { self.fail(error); reply(Reply(error: Failure.wrapping(error))) }
+                } catch { self.fail(session, error); reply(Reply(error: Failure.wrapping(error))) }
             }
         }
     }
