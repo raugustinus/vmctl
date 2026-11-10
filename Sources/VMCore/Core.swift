@@ -64,12 +64,18 @@ public struct Request: Codable {
     public let image: String?
     /// start: absolute path of an installer ISO attached read-only for this boot only.
     public let installer: String?
-    /// create --linux: disk size in bytes; nil means the daemon default (64 GiB).
+    /// create --linux: disk size in bytes; nil means the daemon default (20 GiB).
     public let diskSize: UInt64?
+    /// create --linux: vCPU count; nil means the daemon default (4).
+    public let cpuCount: Int?
+    /// create --linux: memory in bytes; nil means the daemon default (8 GiB).
+    public let memorySize: UInt64?
     public init(command: String, name: String, restore: String? = nil, provisioning: Provisioning? = nil,
-                kind: String? = nil, image: String? = nil, installer: String? = nil, diskSize: UInt64? = nil) {
+                kind: String? = nil, image: String? = nil, installer: String? = nil, diskSize: UInt64? = nil,
+                cpuCount: Int? = nil, memorySize: UInt64? = nil) {
         self.command = command; self.name = name; self.restore = restore; self.provisioning = provisioning
         self.kind = kind; self.image = image; self.installer = installer; self.diskSize = diskSize
+        self.cpuCount = cpuCount; self.memorySize = memorySize
     }
 }
 public struct Reply: Codable {

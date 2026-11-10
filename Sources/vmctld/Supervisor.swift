@@ -335,6 +335,31 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
         return off_t(requested)
     }
+    /// Linux CPU and memory. Defaults are 4 vCPUs and 8 GiB within the framework's limits; an explicit
+    /// request must also fit this host, since more vCPUs than cores or more RAM than installed buys nothing.
+    static func resources(_ request: Request) throws -> (cpus: Int, memory: UInt64) {
+        let minCPU = VZVirtualMachineConfiguration.minimumAllowedCPUCount
+        let maxCPU = VZVirtualMachineConfiguration.maximumAllowedCPUCount
+        let minMemory = VZVirtualMachineConfiguration.minimumAllowedMemorySize
+        let maxMemory = VZVirtualMachineConfiguration.maximumAllowedMemorySize
+        var cpus = min(max(4, minCPU), maxCPU)
+        if let requested = request.cpuCount {
+            let limit = min(maxCPU, ProcessInfo.processInfo.activeProcessorCount)
+            guard requested >= minCPU, requested <= limit else {
+                throw Failure("invalid_cpu_count", "CPU count must be between \(minCPU) and \(limit) on this host.")
+            }
+            cpus = requested
+        }
+        var memory = min(max(8 << 30, minMemory), maxMemory)
+        if let requested = request.memorySize {
+            let limit = min(maxMemory, ProcessInfo.processInfo.physicalMemory) & ~((1 << 20) - 1)
+            guard requested % (1 << 20) == 0, requested >= minMemory, requested <= limit else {
+                throw Failure("invalid_memory_size", "Memory must be a whole number of MiB between \(describe(off_t(minMemory))) and \(describe(off_t(limit))) on this host.")
+            }
+            memory = requested
+        }
+        return (cpus, memory)
+    }
     static func createDisk(at url: URL, copying image: URL?, size: off_t = macDiskSize) throws {
         if let image {
             // Same-volume APFS copies are clones; otherwise this is a full copy on a background queue.
@@ -351,6 +376,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     }
     func createLinux(_ request: Request, reply: @escaping (Reply) -> Void) throws {
         let size = try Self.diskSize(request)
+        let (cpus, memory) = try Self.resources(request)
         let image = try Self.localFile(request.image, "invalid_image", "Disk image")
         if let image {
             let handle = try FileHandle(forReadingFrom: image)
@@ -370,8 +396,6 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             _ = try VZEFIVariableStore(creatingVariableStoreAt: variables, options: [])
             guard chmod(variables.path, 0o600) == 0 else { throw systemFailure("chmod variable store") }
             try Store.check(variables)
-            let cpus = min(max(4, VZVirtualMachineConfiguration.minimumAllowedCPUCount), VZVirtualMachineConfiguration.maximumAllowedCPUCount)
-            let memory = min(max(8 * 1024 * 1024 * 1024, VZVirtualMachineConfiguration.minimumAllowedMemorySize), VZVirtualMachineConfiguration.maximumAllowedMemorySize)
             saved = Configuration(name: request.name, cpuCount: cpus, memorySize: memory, macAddress: VZMACAddress.randomLocallyAdministered().string, installed: false)
             saved.kind = "linux"; saved.firstBootAvailable = true
             try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
@@ -393,7 +417,9 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
     }
     func create(_ request: Request, reply: @escaping (Reply) -> Void) throws {
-        guard request.image == nil, request.installer == nil, request.diskSize == nil else { throw Failure("unsupported_option", "--image, --disk and --iso apply to Linux VMs only.") }
+        guard request.image == nil, request.installer == nil, request.diskSize == nil, request.cpuCount == nil, request.memorySize == nil else {
+            throw Failure("unsupported_option", "--image, --disk, --cpus, --memory and --iso apply to Linux VMs only.")
+        }
         guard let path = request.restore, path.hasPrefix("/") else { throw Failure("restore_required", "Use create [name] --restore /absolute/path/to/Apple.ipsw.") }
         let imageURL = URL(fileURLWithPath: path).standardizedFileURL
         var info = stat()

@@ -8,13 +8,14 @@ func usage() {
            vmctl list
            vmctl rm <name>
            vmctl create [name] --restore /path/to/Apple.ipsw
-           vmctl create [name] --linux [--image /path/to/raw-disk.img] [--disk <size>]
+           vmctl create [name] --linux [--image /path/to/raw-disk.img] [--disk <size>] [--cpus <n>] [--memory <size>]
            vmctl start [name] [--iso /path/to/installer.iso]
            vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
            vmctl stop [name] --force
     create --restore installs a local Apple restore image; it may take a long time.
     create --linux prepares an EFI Linux VM with a blank sparse disk, or a copy of a raw image.
     --disk sets the Linux disk size: 40G, 512M, 1T (bare numbers are GiB). Default 20 GiB, sparse.
+    --cpus and --memory size a Linux VM, e.g. --cpus 1 --memory 512M (bare numbers are GiB). Default 4 CPUs, 8 GiB.
     start --iso attaches an installer ISO (Linux only) for this boot; install it from console.
     --user creates a user and enables SSH on first boot only (macOS 27+ host/guest, or Linux cloud-init).
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
@@ -89,14 +90,14 @@ func readPublicKey(_ value: String) throws -> String {
 }
 func absolute(_ path: String) -> String { URL(fileURLWithPath: path).standardizedFileURL.path }
 /// Binary units: 20G, 20GiB, 512M, 1T; a bare number is GiB. The daemon enforces the allowed range.
-func parseSize(_ text: String) throws -> UInt64 {
+func parseSize(_ text: String, flag: String = "--disk") throws -> UInt64 {
     let lowered = text.lowercased()
     let units: [(String, UInt64)] = [("tib", 1 << 40), ("tb", 1 << 40), ("t", 1 << 40), ("gib", 1 << 30), ("gb", 1 << 30), ("g", 1 << 30),
                                      ("mib", 1 << 20), ("mb", 1 << 20), ("m", 1 << 20)]
     var digits = Substring(lowered), unit: UInt64 = 1 << 30
     if let match = units.first(where: { lowered.hasSuffix($0.0) }) { digits = lowered.dropLast(match.0.count); unit = match.1 }
     guard let count = UInt64(digits), count > 0, count <= UInt64.max / unit else {
-        throw Failure("usage", "--disk takes a size such as 20G, 512M or 1T; a bare number means GiB.")
+        throw Failure("usage", "\(flag) takes a size such as 20G, 512M or 1T; a bare number means GiB.")
     }
     return count * unit
 }
@@ -113,12 +114,12 @@ do {
     if let first = args.first, !first.hasPrefix("--") { name = args.removeFirst() }
     else if command == "rm" { throw Failure("usage", "Usage: vmctl rm <name>. The name is never defaulted for removal.") }
     try validateName(name)
-    var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?
+    var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?, cpuCount: Int?, memorySize: UInt64?
     var provisioning: Provisioning?
     var forceStop = false
     switch command {
     case "create":
-        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>].")
+        let createUsage = Failure("usage", "Use vmctl create [name] --restore /path/to/Apple.ipsw, or create [name] --linux [--image /path/to/raw.img] [--disk <size>] [--cpus <n>] [--memory <size>].")
         if args.count == 2, args[0] == "--restore" { restore = absolute(args[1]) }
         else if args.first == "--linux" {
             kind = "linux"; args.removeFirst()
@@ -129,6 +130,10 @@ do {
                 switch flag {
                 case "--image" where image == nil: image = absolute(value)
                 case "--disk" where diskSize == nil: diskSize = try parseSize(value)
+                case "--cpus" where cpuCount == nil:
+                    guard let count = Int(value), count > 0 else { throw Failure("usage", "--cpus takes a positive whole number.") }
+                    cpuCount = count
+                case "--memory" where memorySize == nil: memorySize = try parseSize(value, flag: "--memory")
                 default: throw createUsage
                 }
             }
@@ -168,7 +173,8 @@ do {
     let fd = try daemonConnection(store); defer { close(fd) }
     Wire.timeout(fd, seconds: command == "create" ? 86400 : 120)
     try Wire.send(Request(command: forceStop ? "force-stop" : (provisioning == nil ? command : "provision"), name: name,
-                          restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer, diskSize: diskSize), to: fd)
+                          restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer, diskSize: diskSize,
+                          cpuCount: cpuCount, memorySize: memorySize), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
     let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your active VM, quit vmctld in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
@@ -181,6 +187,13 @@ do {
         var info = stat()
         if stat(try store.vm(name).appendingPathComponent("disk.img").path, &info) == 0, info.st_size != off_t(diskSize) {
             throw Failure(upgrade.code, "VM \(name) was created with the old daemon's default disk size. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
+        }
+    }
+    if cpuCount != nil || memorySize != nil, response.value == "created" {
+        // Likewise for --cpus/--memory: an older daemon drops the fields and writes its defaults.
+        let saved = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.vm(name).appendingPathComponent("config.json")))
+        if cpuCount.map({ $0 != saved.cpuCount }) == true || memorySize.map({ $0 != saved.memorySize }) == true {
+            throw Failure(upgrade.code, "VM \(name) was created with the old daemon's default CPU or memory size. \(upgrade.message) Remove ~/.vmctl/vms/\(name) first.")
         }
     }
 

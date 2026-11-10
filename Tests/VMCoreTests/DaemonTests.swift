@@ -165,6 +165,22 @@ final class DaemonTests: XCTestCase {
         var diskInfo = stat()
         XCTAssertEqual(stat(try store.existing("lin3").appendingPathComponent("disk.img").path, &diskInfo), 0)
         XCTAssertEqual(diskInfo.st_size, 2 << 30)
+        XCTAssertEqual(config.cpuCount, 4); XCTAssertEqual(config.memorySize, 8 << 30) // Linux defaults
+        XCTAssertEqual(try client(["create", "lin5", "--linux", "--cpus"]).0, 1)
+        XCTAssertEqual(try client(["create", "lin5", "--linux", "--cpus", "0"]).0, 1)
+        XCTAssertEqual(try client(["create", "lin5", "--linux", "--cpus", "two"]).0, 1)
+        XCTAssertEqual(try client(["create", "lin5", "--linux", "--memory", "lots"]).0, 1)
+        XCTAssertEqual(try client(["create", "lin5", "--restore", "/x.ipsw", "--cpus", "2"]).0, 1) // Linux only
+        let tooManyCPUs = try client(["create", "lin5", "--linux", "--cpus", "4096"])
+        XCTAssertEqual(tooManyCPUs.0, 1); XCTAssertTrue(tooManyCPUs.1.contains("invalid_cpu_count"), tooManyCPUs.1)
+        let tooMuchMemory = try client(["create", "lin5", "--linux", "--memory", "1024T"])
+        XCTAssertEqual(tooMuchMemory.0, 1); XCTAssertTrue(tooMuchMemory.1.contains("invalid_memory_size"), tooMuchMemory.1)
+        XCTAssertThrowsError(try store.existing("lin5")) // rejected before the directory is reserved
+        let small = try client(["create", "lin5", "--linux", "--cpus", "1", "--memory", "512M"])
+        XCTAssertEqual(small.0, 0, small.1); XCTAssertEqual(small.1, "created\n")
+        let smallConfig = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.existing("lin5").appendingPathComponent("config.json")))
+        XCTAssertEqual(smallConfig.cpuCount, 1); XCTAssertEqual(smallConfig.memorySize, 512 << 20)
+        XCTAssertEqual(try client(["rm", "lin5"]).1, "removed\n")
         let bigImage = root.appendingPathComponent("big.raw")
         let bigHandle = try FileHandle(forWritingTo: { FileManager.default.createFile(atPath: bigImage.path, contents: nil); return bigImage }())
         try bigHandle.truncate(atOffset: 3 << 30); try bigHandle.close()

@@ -165,9 +165,12 @@ them elsewhere. Names containing `amd64`, `x86_64` or `i386` are refused, becaus
 arm64 guests boot here; an unbootable image otherwise shows up as `running` followed a
 second later by a `guest_powered_off` log event. Image and ISO paths must be absolute
 local regular files. Resources default to 4 CPUs and 8 GiB, clamped to the host's
-allowed range. `created` means the disk is prepared, not that anything is installed.
-If `create --disk` reports `daemon_upgrade_required`, the running daemon predates the
-flag and built the default size; remove that VM directory, restart the daemon and retry.
+allowed range; `--cpus 1 --memory 512M` (a bare memory number is GiB) picks others,
+up to this host's core count and installed RAM. They are fixed at create time.
+`created` means the disk is prepared, not that anything is installed.
+If `create --disk`, `--cpus` or `--memory` reports `daemon_upgrade_required`, the running
+daemon predates the flag and built the defaults; remove that VM directory, restart the
+daemon and retry.
 
 `--iso` attaches the installer as a read-only USB mass storage device for that boot
 only. `--user` on a Linux VM writes a cloud-init NoCloud seed (`cloud-init.img`, a
