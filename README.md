@@ -198,8 +198,9 @@ With `--ssh-key`, which takes a public key line or the path of a `.pub` file, th
 account is key-only: no password prompt, password login locked, SSH password
 authentication disabled. Without it, the password is prompted as for macOS and SSH
 password login is enabled. The seed holds the sha512-crypt hash of the password,
-never the plaintext, and the public key. vmctl never generates, stores or reads
-private keys; `docs/AGENT-ACCESS.md` explains how that fits an AI-agent workflow.
+never the plaintext, and the public key. vmctl never reads, stores or forwards your
+private keys; the only private key it makes is the guest's own SSH host key (see
+below). `docs/AGENT-ACCESS.md` explains how that fits an AI-agent workflow.
 `--ssh-key` and `--iso` are rejected for macOS VMs; `--restore` for Linux VMs.
 
 The seed also generates your Mac's locale in the guest (from `LC_ALL`, `LC_CTYPE` or
@@ -235,6 +236,35 @@ and your home directory are refused. The share is fixed at create time and check
 at every start, so a moved or deleted project directory makes `start` fail with
 `invalid_share` instead of booting without it. VMs created before `--share` have no
 share; create a new one, which takes seconds from the APFS-cloned image.
+
+### Reach VMs by name with ssh and git
+
+Provisioning a Linux VM (`start --user`) adds a `Host <name>.vm` block to
+`~/.vmctl/ssh_config`, and `rm` removes it. vmctl never reads or edits `~/.ssh/config`;
+add this line yourself, at the top, before any `Host` block:
+
+```sh
+Include ~/.vmctl/ssh_config
+```
+
+Then:
+
+```sh
+ssh proj.vm
+git remote add vm proj.vm:myproject && git push vm main
+```
+
+The block sets the user, a `ProxyCommand` that looks up the VM's current address
+with `vmctl ip`, `StrictHostKeyChecking yes` against a per-VM known_hosts file,
+`ForwardAgent no`, and `IdentitiesOnly yes` with the private key next to the
+`--ssh-key` `.pub` file. vmctl makes the guest's host key on the Mac and installs it
+through cloud-init, so the first connection is already verified.
+
+After every provisioning, vmctl runs `ssh -G proj.vm` to check whether the Include
+is in effect. It says so if it isn't, and warns if an earlier block in your
+config (such as `Host *`) turns agent forwarding back on. VMs provisioned before
+this feature, and macOS guests, have no pinned key; `vmctl ssh-config <vm> --user dev
+--host-key <file>` adds one. Run `vmctl help ssh-config` for details.
 
 ### Direct kernel boot
 

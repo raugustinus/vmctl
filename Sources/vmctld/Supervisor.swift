@@ -85,6 +85,54 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             _ = data.withUnsafeBytes { Darwin.write(fd, $0.baseAddress!, $0.count) }
         } catch { fputs("Logging failed: \(error)\n", stderr) }
     }
+    /// An absolute path, recorded as given: the daemon never opens anything in ~/.ssh.
+    static func identityFile(_ path: String?) throws -> String? {
+        guard let path else { return nil }
+        guard path.hasPrefix("/"), !path.contains("\""),
+              !path.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) else {
+            throw Failure("invalid_identity", "The identity file must be an absolute path without quotes or control characters.")
+        }
+        return URL(fileURLWithPath: path).standardizedFileURL.path
+    }
+    /// A fresh ed25519 host key pair for a guest, made by the system ssh-keygen in a private temporary
+    /// directory that is removed afterwards. The private half goes only into the guest's seed.
+    func generateHostKey(_ name: String) throws -> CloudInit.HostKey {
+        var template = Array(store.root.appendingPathComponent(".hostkey.XXXXXX").path.utf8CString)
+        guard template.withUnsafeMutableBufferPointer({ mkdtemp($0.baseAddress!) }) != nil else { throw systemFailure("mkdtemp") }
+        let temporary = URL(fileURLWithPath: String(cString: template))
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let key = temporary.appendingPathComponent("key")
+        let keygen = Process()
+        keygen.executableURL = URL(fileURLWithPath: "/usr/bin/ssh-keygen")
+        keygen.arguments = ["-q", "-t", "ed25519", "-N", "", "-C", SSHConfig.host(name), "-f", key.path]
+        keygen.standardInput = FileHandle.nullDevice; keygen.standardOutput = FileHandle.nullDevice; keygen.standardError = FileHandle.nullDevice
+        try keygen.run(); keygen.waitUntilExit()
+        guard keygen.terminationStatus == 0 else { throw Failure("host_key_failed", "ssh-keygen could not create a host key for \(name).") }
+        return CloudInit.HostKey(privateKey: String(decoding: try Data(contentsOf: key), as: UTF8.self),
+                                 publicKey: String(decoding: try Data(contentsOf: key.appendingPathExtension("pub")), as: UTF8.self)
+                                    .trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+    /// Writes `name`'s block into ~/.vmctl/ssh_config from its saved user and pinned host key; returns the block.
+    @discardableResult
+    func writeSSHEntry(_ name: String, _ saved: Configuration) throws -> String {
+        guard let user = saved.sshUser else {
+            throw Failure("ssh_user_unknown", "vmctl does not know \(name)'s guest user (it was provisioned before vmctl recorded it). Pass --user.")
+        }
+        let knownHosts = try store.knownHosts(name)
+        guard FileManager.default.fileExists(atPath: knownHosts.path) else {
+            throw Failure("host_key_unknown", "No pinned host key for \(name). Pass --host-key with the guest's /etc/ssh/ssh_host_ed25519_key.pub; see vmctl help ssh-config.")
+        }
+        try Store.check(knownHosts)
+        // vmctl beside this daemon, by absolute path; VMCTL_HOME only when the store is not the default.
+        let vmctl = Bundle.main.executableURL.map { $0.resolvingSymlinksInPath().deletingLastPathComponent().appendingPathComponent("vmctl").path }
+        let defaultRoot = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".vmctl").standardizedFileURL.path
+        let home = store.root.standardizedFileURL.path == defaultRoot ? nil : store.root.path
+        let entry = SSHConfig.Entry(name: name, user: user, identityFile: saved.sshIdentityFile, knownHostsFile: knownHosts.path,
+                                    proxyCommand: try SSHConfig.proxyCommand(name: name, vmctl: vmctl.flatMap { FileManager.default.isExecutableFile(atPath: $0) ? $0 : nil } ?? "vmctl", home: home))
+        let block = try SSHConfig.block(entry)
+        try store.updateSSHConfig(name: name, block: block)
+        return block
+    }
     func saved(_ name: String) throws -> (URL, Configuration) {
         let dir = try store.existing(name)
         return (dir, try JSONDecoder().decode(Configuration.self, from: Store.read(dir.appendingPathComponent("config.json"))))
@@ -221,7 +269,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     func handle(_ request: Request, reply: @escaping (Reply) -> Void) {
         dispatchPrecondition(condition: .onQueue(.main))
         do {
-            try validateName(request.name)
+            // ssh-config without a name regenerates every VM's entry.
+            if !(request.command == "ssh-config" && request.name.isEmpty) { try validateName(request.name) }
             // Reconcile live framework state, never disk or network reachability.
             for session in sessions.values where (session.phase == "running" || session.phase == "stopping") && session.machine?.state == .stopped {
                 finishStop(session)
@@ -266,13 +315,19 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                     guard let credentials = request.provisioning else { throw Failure("invalid_provisioning", "Missing account details.") }
                     try credentials.validate()
                     try validateProvisioningEligibility(saved)
+                    let identity = try Self.identityFile(request.sshIdentityFile)
+                    saved.sshUser = credentials.username; saved.sshIdentityFile = identity
                     if saved.isLinux {
-                        // Only the password hash and the public key reach the seed.
+                        // Only the password hash, the public key and the guest's own new host key reach the seed.
                         let share = saved.share.map {
                             CloudInit.SeedShare(name: Share.mountName($0), readOnly: saved.shareReadOnly == true, hostUID: Int(getuid()))
                         }
-                        try Store.write(try CloudInit.seedImage(credentials, hostname: request.name, mac: saved.macAddress, share: share),
+                        let hostKey = try generateHostKey(request.name)
+                        try Store.write(try CloudInit.seedImage(credentials, hostname: request.name, mac: saved.macAddress, share: share, hostKey: hostKey),
                                         to: dir.appendingPathComponent("cloud-init.img"))
+                        // Pinned now, from the key just generated: the first connection is verified, not trusted.
+                        try store.writeKnownHosts(name: request.name, hostKey: hostKey.publicKey)
+                        try writeSSHEntry(request.name, saved)
                     } else {
                         guard credentials.sshPublicKey == nil, let password = credentials.password else {
                             throw Failure("invalid_provisioning", "macOS guests are provisioned with a password only; --ssh-key applies to Linux VMs.")
@@ -342,6 +397,8 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 // The directory is the whole VM: identity, EFI/auxiliary stores, disk, seed and logs.
                 try FileManager.default.removeItem(at: dir)
                 sessions[request.name] = nil
+                try store.updateSSHConfig(name: request.name, block: nil)
+                try store.removeKnownHosts(name: request.name)
                 reply(Reply(value: "removed"))
             case "status":
                 // No disk/config/image reads. The private VM directory only establishes existence.
@@ -365,6 +422,37 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 var text = String(decoding: try handle.readToEnd() ?? Data(), as: UTF8.self)
                 if offset > 0, let newline = text.firstIndex(of: "\n") { text = String(text[text.index(after: newline)...]) }
                 reply(Reply(value: text.trimmingCharacters(in: .newlines)))
+            case "ssh-config":
+                if request.name.isEmpty {
+                    guard request.sshUser == nil, request.sshIdentityFile == nil, request.hostKey == nil else {
+                        throw Failure("usage", "--user, --identity and --host-key need a VM name.")
+                    }
+                    let directory = store.root.appendingPathComponent("vms")
+                    try Store.check(directory, directory: true)
+                    var out: [String] = []
+                    for name in try FileManager.default.contentsOfDirectory(atPath: directory.path).sorted() {
+                        guard (try? store.existing(name)) != nil else { continue }
+                        do { out.append(try writeSSHEntry(name, try saved(name).1)) }
+                        catch let failure as Failure { out.append("# \(name): skipped. \(failure.message)") }
+                    }
+                    reply(Reply(value: out.joined(separator: "\n")))
+                    return
+                }
+                let (dir, loaded) = try saved(request.name)
+                var saved = loaded
+                if let user = request.sshUser {
+                    guard user.range(of: "^[a-z_][a-z0-9_-]{0,31}\\z", options: .regularExpression) != nil else {
+                        throw Failure("invalid_user", "Guest user names are lowercase letters, digits, - and _.")
+                    }
+                    saved.sshUser = user
+                }
+                if let identity = try Self.identityFile(request.sshIdentityFile) { saved.sshIdentityFile = identity }
+                if let hostKey = request.hostKey { _ = try SSHConfig.knownHostsLine(name: request.name, hostKey: hostKey) }
+                if request.sshUser != nil || request.sshIdentityFile != nil {
+                    try Store.write(JSONEncoder().encode(saved), to: dir.appendingPathComponent("config.json"))
+                }
+                if let hostKey = request.hostKey { try store.writeKnownHosts(name: request.name, hostKey: hostKey) }
+                reply(Reply(value: try writeSSHEntry(request.name, saved)))
             case "ip":
                 guard let current, current.phase == "running", let mac = current.mac else { throw Failure("not_running", "VM is not running.") }
                 guard let ip = Self.leaseIP(mac: mac, name: request.name) else { throw Failure("ip_unknown", "No unexpired NAT lease is readable for this VM. Guest networking may not be ready.") }

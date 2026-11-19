@@ -45,7 +45,12 @@ final class CloudInitTests: XCTestCase {
         }
         // Neither: no runcmd, no uid, no write_files, and never cloud-init's own locale key.
         let plain = try object(CloudInit.userData(Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key), hostname: "lin"))
-        XCTAssertNil(plain["runcmd"]); XCTAssertNil(plain["write_files"]); XCTAssertNil(plain["locale"])
+        XCTAssertNil(plain["runcmd"]); XCTAssertNil(plain["write_files"]); XCTAssertNil(plain["locale"]); XCTAssertNil(plain["ssh_keys"])
+        // A host-generated host key replaces the image's keys, and no other key types are generated.
+        let keyed = try object(CloudInit.userData(Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key), hostname: "lin",
+                                                  hostKey: CloudInit.HostKey(privateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n", publicKey: Self.key)))
+        XCTAssertEqual(keyed["ssh_keys"] as? [String: String], ["ed25519_private": "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n", "ed25519_public": Self.key])
+        XCTAssertEqual(keyed["ssh_genkeytypes"] as? [String], []); XCTAssertEqual(keyed["ssh_deletekeys"] as? Bool, true)
         XCTAssertNil((plain["users"] as? [[String: Any]])?.first?["uid"])
 
         let account = Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key, locale: "en_US.UTF-8")

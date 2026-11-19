@@ -87,14 +87,17 @@ removes its socket and PID file. It stays alive if shutdown fails.
   daemon.lock            # flock held for the daemon lifetime
   daemon.pid             # diagnostic, never treated as liveness authority
   daemon.log             # daemon startup errors
+  ssh_config             # one `Host <name>.vm` block per provisioned VM; include it from ~/.ssh/config
+  known_hosts/<name>     # that VM's pinned SSH host key
   vms/<name>/
-    config.json          # version, name, kind, CPU, RAM, MAC, installed flag, guest version, first-boot eligibility
+    config.json          # version, name, kind, CPU, RAM, MAC, installed flag, guest version, first-boot eligibility,
+                         # provisioned user and IdentityFile path
     hardware-model       # macOS: VZMacHardwareModel.dataRepresentation
     machine-identifier   # VZMacMachineIdentifier or VZGenericMachineIdentifier data
     auxiliary-storage    # macOS: persistent Mac auxiliary storage
     efi-variable-store   # Linux EFI boot: persistent EFI variables, including boot order
     kernel, initrd       # Linux --kernel boot: private copies; config.json holds the command line
-    cloud-init.img       # Linux, after --user: NoCloud seed (password hash, public key, network config)
+    cloud-init.img       # Linux, after --user: NoCloud seed (password hash, public key, guest host key, network config)
     disk.img             # writable Virtio block image
     logs/daemon.jsonl
     logs/console.log     # Linux --kernel boot: virtio console (hvc0) output, appended
@@ -120,7 +123,18 @@ saved PID. `status` never guesses from a PID or opens a live disk to detect lock
 The current Unix user is the trust boundary: this does not isolate VM files from
 other processes running as the same user. Do not run as root or put state in a
 shared writable directory. No shell commands supplied by guests are executed.
-The CLI's only child is the sibling daemon; the daemon spawns no commands.
+The CLI starts the sibling daemon and, after provisioning or `ssh-config`, `/usr/bin/ssh -G <name>.vm`
+to see whether ~/.ssh/config includes vmctl's file. The daemon's only child is `/usr/bin/ssh-keygen`,
+with fixed arguments, to make a guest host key at Linux provisioning.
+
+`ssh_config` holds one block per VM between `# BEGIN vmctl <name>` and `# END vmctl <name>`.
+Updates replace or remove only that span and keep every other line byte for byte. Both it and
+the known_hosts files are written atomically: a 0600 temporary file in the same directory,
+fsync, rename. vmctl never opens anything in `~/.ssh`. The IdentityFile path is derived from
+the `--ssh-key` argument (`foo.pub` gives `foo`), not looked up. The guest's host key is
+made on the Mac and handed to cloud-init (`ssh_keys`, with `ssh_genkeytypes: []`), so
+known_hosts is pinned before the first connection. Its private half sits in the guest's
+seed, readable by the same Unix user like everything else under `~/.vmctl`.
 
 `VMCTL_HOME` can override the absolute state directory for isolated testing. The
 same environment must be used by clients targeting that daemon. Keep the path

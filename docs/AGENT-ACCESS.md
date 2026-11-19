@@ -18,8 +18,9 @@ vmctl now supplies the guest half of it.
    Without a prompt, an AI agent that can run `ssh` can use the key freely, so the prompt
    is the actual control, and key-material isolation is the backstop.
 3. The **public key is installed into the guest at first boot** by vmctl, through cloud-init
-   (`vmctl start NAME --user U --ssh-key KEY`). vmctl never generates, stores, reads, or
-   forwards a private key. There is nothing under `~/.vmctl` worth exfiltrating.
+   (`vmctl start NAME --user U --ssh-key KEY`). vmctl never reads, stores, or forwards your
+   private keys. The only private key it makes is the guest's SSH host key, and that key only
+   lets something impersonate that VM to this Mac.
 
 So, with a key created in 1Password (or any agent that prompts), this works today:
 
@@ -31,6 +32,51 @@ ssh dev@"$(./bin/vmctl ip lin)"     # the human approves the signature; the AI a
 
 The AI agent runs `vmctl` and `ssh` itself. It needs the public key, the VM's IP, and an
 `SSH_AUTH_SOCK` (or `IdentityAgent` in `~/.ssh/config`) that points at the prompting agent.
+
+## Moving a repository in and out: push and fetch from the Mac
+
+The VM holds no key that reaches your Git host, your Mac, or anything else. Only the Mac
+holds a key, and it reaches the VM. So code moves the same way: the Mac pushes into the
+VM and fetches the agent's commits back, then pushes to the real remote itself.
+
+Once `~/.ssh/config` starts with `Include ~/.vmctl/ssh_config` (see `vmctl help
+ssh-config`), every provisioned VM is reachable as `<name>.vm`. The block pins the
+VM's host key, which vmctl generated before the first boot, and sets `ForwardAgent no`.
+
+One-time setup, from the project directory on the Mac:
+
+```sh
+ssh proj.vm 'sudo apt-get update -q && sudo apt-get install -y -q git &&
+  git init -q -b main myproject &&
+  git -C myproject config receive.denyCurrentBranch updateInstead'
+git remote add vm proj.vm:myproject
+git push vm main
+```
+
+`updateInstead` lets a push update the branch that is checked out in the VM, together
+with its working tree, so no separate bare repository is needed. The push is refused
+if that working tree has uncommitted changes, so an agent's work in progress is never
+overwritten. Set `user.name` and `user.email` inside the VM so the agent can commit.
+
+Day to day:
+
+```sh
+git fetch vm                   # the agent's commits
+git log -p main..vm/main       # review them
+git merge --ff-only vm/main    # or cherry-pick
+git push origin main           # only the Mac talks to the real remote
+```
+
+Why fetch, not a shared `.git`. Fetching copies objects and refs only. Hooks and
+`.git/config` stay in the VM, so nothing in them runs on the Mac. A read-write
+`--share` of the repository would let the guest write `.git/hooks/*`, or set
+`core.fsmonitor` or `core.sshCommand` in `.git/config`. Those run on the Mac the next
+time you run `git status`, `git commit` or `git push` there, with your keys available.
+If you share the repository at all, share it `:ro`.
+
+Never `ssh -A` into the VM: root in the guest could use the forwarded agent to sign as
+you for as long as the connection is open. The generated block sets `ForwardAgent no`;
+`vmctl` warns if an earlier `Host *` in your config overrides it.
 
 ## What this does and does not protect
 

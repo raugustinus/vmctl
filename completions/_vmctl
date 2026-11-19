@@ -22,6 +22,8 @@ _vmctl() {
     'list:list VMs with state and address'
     'console:open a console window for a running VM'
     'rm:delete a stopped VM'
+    'ssh-config:write and print the <name>.vm ssh_config entry'
+    'help:show usage, or help ssh-config'
   )
   _arguments -C '1:command:->command' '*::argument:->argument' && return
   case $state in
@@ -50,6 +52,13 @@ _vmctl() {
             '--ssh-key[public key, or a .pub file]:public key:_files -g "*.pub(-.)"' ;;
         stop) _arguments '1:VM name:_vmctl_names' '--force[power off immediately]' ;;
         status|ip|logs|console|rm) _arguments '1:VM name:_vmctl_names' ;;
+        ssh-config)
+          _arguments \
+            '1:VM name:_vmctl_names' \
+            '--user[guest account, for VMs provisioned before ssh-config]:account name:' \
+            '--host-key[guest host public key, or a .pub file]:host key:_files' \
+            '--identity[private key for IdentityFile]:private key:_files' ;;
+        help) _arguments '1:topic:(ssh-config)' ;;
       esac ;;
   esac
 }

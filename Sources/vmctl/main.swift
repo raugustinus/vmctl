@@ -14,6 +14,8 @@ func usage() {
            vmctl start [name] [--iso /path/to/installer.iso]
            vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
            vmctl stop [name] --force
+           vmctl ssh-config [name] [--user <user>] [--host-key <key-or-file>] [--identity <private-key>]
+           vmctl help [ssh-config]
     create --restore installs a local Apple restore image; it may take a long time.
     create --linux prepares an EFI Linux VM with a blank sparse disk, or a copy of a raw image.
     --disk sets the Linux disk size: 40G, 512M, 1T (bare numbers are GiB). Default 20 GiB, sparse.
@@ -25,6 +27,8 @@ func usage() {
     start --iso attaches an installer ISO (Linux only) for this boot; install it from console.
     --user creates a user and enables SSH on first boot only (macOS 27+ host/guest, or Linux cloud-init).
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
+    A Linux VM started with --user becomes <name>.vm in ~/.vmctl/ssh_config, with a pinned host key;
+    see vmctl help ssh-config.
     Without --ssh-key the password is prompted securely on the terminal, never accepted as an argument.
     Default name: mac. stop waits up to 30 seconds for guest shutdown before forcing power-off.
     stop --force powers off immediately; unsaved guest data may be lost.
@@ -32,6 +36,75 @@ func usage() {
     console opens a local window for a running VM; closing it keeps the VM running.
     rm deletes a stopped VM's directory (disk, identity, logs); it cannot be undone.
     """)
+}
+func sshConfigHelp() {
+    print("""
+    vmctl ssh-config: reach VMs by name with plain ssh and git.
+
+    vmctl keeps one block per VM in ~/.vmctl/ssh_config, written when a Linux VM is first started
+    with --user, removed by vmctl rm:
+
+        Host <vm>.vm
+          User <the --user account>
+          ProxyCommand sh -c 'nc "$(vmctl ip <vm>)" 22'
+          UserKnownHostsFile ~/.vmctl/known_hosts/<vm>
+          StrictHostKeyChecking yes
+          ForwardAgent no
+          IdentitiesOnly yes
+          IdentityFile <the private key beside the --ssh-key .pub file>
+
+    The guest's host key is generated on this Mac at provisioning and installed by cloud-init, so
+    known_hosts is pinned before the first connection; nothing is trusted on first use.
+
+    vmctl never reads or edits ~/.ssh/config. Add this line yourself, at the TOP of ~/.ssh/config,
+    before any Host block (ssh uses the first value it finds for each option, so an earlier
+    `Host *` block would override vmctl's settings):
+
+        \(SSHConfig.includeLine)
+
+    Then, for example:
+
+        ssh <vm>.vm
+        git remote add vm <vm>.vm:proj && git push vm main
+
+    vmctl ssh-config [<vm>]
+        Rewrites the block for one VM (or for every VM, without a name) and prints it.
+    vmctl ssh-config <vm> --user <user> --host-key <key-or-file> [--identity <private-key-path>]
+        For VMs provisioned before this feature, or macOS guests: vmctl did not generate their host
+        key, so supply it. Fetch it over a connection you already trust, for example:
+            ssh dev@"$(vmctl ip <vm>)" cat /etc/ssh/ssh_host_ed25519_key.pub > /tmp/<vm>.hostkey
+            vmctl ssh-config <vm> --user dev --host-key /tmp/<vm>.hostkey --identity ~/.ssh/id_ed25519
+    """)
+}
+/// Whether ~/.ssh/config already includes vmctl's file for this VM, judged from `ssh -G`, so ssh
+/// resolves its own configuration and vmctl never opens ~/.ssh/config.
+func sshReachability(_ name: String, store: Store) -> String {
+    let host = SSHConfig.host(name)
+    let notice = """
+    \(host) is not reachable by name yet. Add this line at the top of ~/.ssh/config, before any Host blocks:
+        \(SSHConfig.includeLine)
+    See `vmctl help ssh-config`.
+    """
+    let ssh = Process(), pipe = Pipe()
+    ssh.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+    ssh.arguments = ["-G", host]
+    ssh.standardInput = FileHandle.nullDevice; ssh.standardOutput = pipe; ssh.standardError = FileHandle.nullDevice
+    guard (try? ssh.run()) != nil else { return notice }
+    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    ssh.waitUntilExit()
+    var options: [String: String] = [:]
+    for line in output.split(separator: "\n") {
+        let parts = line.split(separator: " ", maxSplits: 1)
+        if parts.count == 2, options[String(parts[0])] == nil { options[String(parts[0])] = String(parts[1]) }
+    }
+    guard let knownHosts = try? store.knownHosts(name).path,
+          options["proxycommand"]?.contains(" ip \(name))") == true,
+          options["userknownhostsfile"]?.contains(knownHosts) == true else { return notice }
+    var result = "Reachable as \(host) — e.g. git remote add vm \(host):proj"
+    if options["forwardagent"] == "yes" {
+        result += "\nWarning: ssh resolves ForwardAgent yes for \(host), so an earlier block in ~/.ssh/config (such as Host *) overrides vmctl's. Move the Include line above it."
+    }
+    return result
 }
 func daemonConnection(_ store: Store) throws -> Int32 {
     do { return try Wire.connect(store.socketPath) }
@@ -114,15 +187,24 @@ do {
     var args = Array(CommandLine.arguments.dropFirst())
     if args.isEmpty || args == ["--help"] || args == ["-h"] { usage(); exit(0) }
     let command = args.removeFirst()
-    guard ["create", "start", "stop", "status", "ip", "logs", "list", "console", "rm"].contains(command) else { throw Failure("usage", "Unknown command. Run vmctl --help.") }
+    if command == "help" {
+        switch args {
+        case []: usage()
+        case ["ssh-config"]: sshConfigHelp()
+        default: throw Failure("usage", "Use vmctl help [ssh-config].")
+        }
+        exit(0)
+    }
+    guard ["create", "start", "stop", "status", "ip", "logs", "list", "console", "rm", "ssh-config"].contains(command) else { throw Failure("usage", "Unknown command. Run vmctl --help.") }
     if command == "list", !args.isEmpty { throw Failure("usage", "Usage: vmctl list (no arguments).") }
-    var name = "mac"
+    var name = command == "ssh-config" ? "" : "mac" // ssh-config without a name covers every VM.
     if let first = args.first, !first.hasPrefix("--") { name = args.removeFirst() }
     else if command == "rm" { throw Failure("usage", "Usage: vmctl rm <name>. The name is never defaulted for removal.") }
-    try validateName(name)
+    if !name.isEmpty { try validateName(name) }
     var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?, cpuCount: Int?, memorySize: UInt64?
     var kernel: String?, initrd: String?, kernelCommandLine: String?, share: String?, shareReadOnly: Bool?
     var provisioning: Provisioning?
+    var sshIdentityFile: String?, sshUser: String?, hostKey: String?
     var forceStop = false
     switch command {
     case "create":
@@ -154,6 +236,18 @@ do {
             if kernel == nil, initrd != nil || kernelCommandLine != nil { throw Failure("usage", "--initrd and --cmdline require --kernel.") }
             if let kernelCommandLine { try KernelBoot.validate(commandLine: kernelCommandLine) }
         } else { throw createUsage }
+    case "ssh-config":
+        while !args.isEmpty {
+            let flag = args.removeFirst()
+            guard !args.isEmpty else { throw Failure("usage", "Missing value for \(flag).") }
+            let value = args.removeFirst()
+            switch flag {
+            case "--user" where sshUser == nil: sshUser = value
+            case "--identity" where sshIdentityFile == nil: sshIdentityFile = absolute(value)
+            case "--host-key" where hostKey == nil: hostKey = try readPublicKey(value)
+            default: throw Failure("usage", "Use vmctl ssh-config [name] [--user <user>] [--identity <private-key-path>] [--host-key <key-or-file>].")
+            }
+        }
     case "stop":
         if args == ["--force"] { forceStop = true } else if !args.isEmpty { throw Failure("usage", "Use vmctl stop [name] [--force].") }
     case "start":
@@ -165,7 +259,13 @@ do {
             switch flag {
             case "--user" where username == nil: username = value
             case "--full-name" where fullName == nil: fullName = value
-            case "--ssh-key" where sshKey == nil: sshKey = try readPublicKey(value)
+            case "--ssh-key" where sshKey == nil:
+                sshKey = try readPublicKey(value)
+                // A key given as foo.pub names its private half, foo, for IdentityFile. The path is
+                // derived, never opened: vmctl reads nothing in ~/.ssh beyond the .pub it was given.
+                if value.hasSuffix(".pub"), !Provisioning.publicKeyTypes.contains(where: { value.hasPrefix($0 + " ") }) {
+                    sshIdentityFile = String(absolute(value).dropLast(4))
+                }
             case "--iso" where installer == nil: installer = absolute(value)
             default: throw Failure("usage", "Use start [name] [--iso <path>] [--user <username> [--full-name <name>] [--ssh-key <key>]]. Passwords must be entered at the prompt.")
             }
@@ -195,11 +295,12 @@ do {
                           restore: restore, provisioning: provisioning, kind: kind, image: image, installer: installer, diskSize: diskSize,
                           cpuCount: cpuCount, memorySize: memorySize,
                           kernel: kernel, initrd: initrd, kernelCommandLine: kernelCommandLine,
-                          share: share, shareReadOnly: shareReadOnly), to: fd)
+                          share: share, shareReadOnly: shareReadOnly,
+                          sshIdentityFile: sshIdentityFile, sshUser: sshUser, hostKey: hostKey), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
     let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your running VMs, quit vmctld in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
-        let newer = provisioning != nil || forceStop || ["list", "console", "rm"].contains(command) || kind != nil || installer != nil
+        let newer = provisioning != nil || forceStop || ["list", "console", "rm", "ssh-config"].contains(command) || kind != nil || installer != nil
         if newer, error.code == "invalid_command" || (kind != nil && error.code == "restore_required") { throw upgrade }
         throw error
     }
@@ -220,6 +321,18 @@ do {
     }
 
     if let value = response.value, !value.isEmpty { print(value) }
+    if provisioning != nil {
+        let saved = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.vm(name).appendingPathComponent("config.json")))
+        if saved.isLinux {
+            // A daemon without ssh_config support provisions without pinning a host key.
+            guard FileManager.default.fileExists(atPath: try store.knownHosts(name).path) else {
+                throw Failure(upgrade.code, "VM \(name) was provisioned without an ssh_config entry. \(upgrade.message)")
+            }
+            print(sshReachability(name, store: store))
+        }
+    } else if command == "ssh-config", !name.isEmpty {
+        print(sshReachability(name, store: store))
+    }
 } catch {
     let reply = Reply(error: Failure.wrapping(error))
     if let data = try? JSONEncoder().encode(reply) { FileHandle.standardError.write(data); FileHandle.standardError.write(Data([10])) }

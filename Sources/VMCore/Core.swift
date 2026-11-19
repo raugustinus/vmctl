@@ -101,16 +101,24 @@ public struct Request: Codable {
     public let share: String?
     /// create --linux --share DIR:ro: the guest may read but not write the shared directory.
     public let shareReadOnly: Bool?
+    /// provision, ssh-config: absolute path of the private key matching the installed public key, for IdentityFile.
+    public let sshIdentityFile: String?
+    /// ssh-config: guest user name, for VMs provisioned before vmctl recorded it.
+    public let sshUser: String?
+    /// ssh-config: the guest's SSH host public key, for VMs whose host key vmctl did not generate.
+    public let hostKey: String?
     public init(command: String, name: String, restore: String? = nil, provisioning: Provisioning? = nil,
                 kind: String? = nil, image: String? = nil, installer: String? = nil, diskSize: UInt64? = nil,
                 cpuCount: Int? = nil, memorySize: UInt64? = nil,
                 kernel: String? = nil, initrd: String? = nil, kernelCommandLine: String? = nil,
-                share: String? = nil, shareReadOnly: Bool? = nil) {
+                share: String? = nil, shareReadOnly: Bool? = nil,
+                sshIdentityFile: String? = nil, sshUser: String? = nil, hostKey: String? = nil) {
         self.command = command; self.name = name; self.restore = restore; self.provisioning = provisioning
         self.kind = kind; self.image = image; self.installer = installer; self.diskSize = diskSize
         self.cpuCount = cpuCount; self.memorySize = memorySize
         self.kernel = kernel; self.initrd = initrd; self.kernelCommandLine = kernelCommandLine
         self.share = share; self.shareReadOnly = shareReadOnly
+        self.sshIdentityFile = sshIdentityFile; self.sshUser = sshUser; self.hostKey = hostKey
     }
 }
 /// One host directory shared into a Linux guest over virtiofs under a fixed tag. With cloud-init
@@ -175,6 +183,9 @@ public struct Configuration: Codable {
     /// Linux only: host directory attached over virtiofs at every boot, tagged `Share.tag`.
     public var share: String?
     public var shareReadOnly: Bool?
+    /// The account provisioned on first boot and the private key for it, for the `<name>.vm` ssh_config block.
+    public var sshUser: String?
+    public var sshIdentityFile: String?
     public init(name: String, cpuCount: Int, memorySize: UInt64, macAddress: String, installed: Bool) {
         self.name = name; self.cpuCount = cpuCount; self.memorySize = memorySize
         self.macAddress = macAddress; self.installed = installed
@@ -231,10 +242,30 @@ public struct Store {
     public func existing(_ name: String) throws -> URL {
         let url = try vm(name); try Self.check(url, directory: true); return url
     }
+    /// Atomic replace: a 0600 temporary file in the same directory, written, synced, then renamed over
+    /// the target, so readers see the old or the new file and never a partial or wider-permission one.
     public static func write(_ data: Data, to url: URL) throws {
         if FileManager.default.fileExists(atPath: url.path) { try check(url) }
-        try data.write(to: url, options: .atomic)
-        guard chmod(url.path, 0o600) == 0 else { throw systemFailure("chmod") }
+        var template = Array(url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).XXXXXX").path.utf8CString)
+        let fd = template.withUnsafeMutableBufferPointer { mkstemp($0.baseAddress!) }
+        guard fd >= 0 else { throw systemFailure("create \(url.lastPathComponent)") }
+        let temporary = String(cString: template)
+        var open = true
+        defer { if open { close(fd) } }
+        do {
+            guard fchmod(fd, 0o600) == 0 else { throw systemFailure("chmod") }
+            try data.withUnsafeBytes { buffer in
+                var offset = 0
+                while offset < buffer.count {
+                    let n = Darwin.write(fd, buffer.baseAddress!.advanced(by: offset), buffer.count - offset)
+                    if n < 0 && errno == EINTR { continue }
+                    guard n > 0 else { throw systemFailure("write \(url.lastPathComponent)") }; offset += n
+                }
+            }
+            guard fsync(fd) == 0 else { throw systemFailure("fsync") }
+            close(fd); open = false
+            guard rename(temporary, url.path) == 0 else { throw systemFailure("rename \(url.lastPathComponent)") }
+        } catch { unlink(temporary); throw error }
     }
     public static func read(_ url: URL) throws -> Data { try check(url); return try Data(contentsOf: url) }
 }

@@ -13,7 +13,12 @@ public enum CloudInit {
         public let name: String, readOnly: Bool, hostUID: Int
         public init(name: String, readOnly: Bool, hostUID: Int) { self.name = name; self.readOnly = readOnly; self.hostUID = hostUID }
     }
-    public static func userData(_ account: Provisioning, hostname: String, share: SeedShare? = nil) throws -> String {
+    /// An SSH host key pair generated on the host, so the host can pin it without trusting a first connection.
+    public struct HostKey {
+        public let privateKey: String, publicKey: String
+        public init(privateKey: String, publicKey: String) { self.privateKey = privateKey; self.publicKey = publicKey }
+    }
+    public static func userData(_ account: Provisioning, hostname: String, share: SeedShare? = nil, hostKey: HostKey? = nil) throws -> String {
         var user: [String: Any] = ["name": account.username, "gecos": account.fullName,
                                    "shell": "/bin/bash", "sudo": "ALL=(ALL) NOPASSWD:ALL"]
         if let password = account.password {
@@ -22,6 +27,13 @@ public enum CloudInit {
         } else { user["lock_passwd"] = true }
         if let key = account.sshPublicKey { user["ssh_authorized_keys"] = [key] }
         var config: [String: Any] = ["hostname": hostname, "users": [user], "ssh_pwauth": account.password != nil]
+        if let hostKey {
+            // cloud-init deletes the image's host keys and installs this pair. Generating no other types
+            // leaves one host key, the one the host pinned in known_hosts.
+            config["ssh_keys"] = ["ed25519_private": hostKey.privateKey, "ed25519_public": hostKey.publicKey]
+            config["ssh_genkeytypes"] = [String]()
+            config["ssh_deletekeys"] = true
+        }
         var runcmd: [Any] = []
         if let locale = account.locale.flatMap(Provisioning.validLocale) {
             // Not cloud-init's `locale:` key: on Debian it passes the name to locale-gen, which ignores
@@ -60,9 +72,9 @@ public enum CloudInit {
         let json = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .withoutEscapingSlashes])
         return String(decoding: json, as: UTF8.self) + "\n"
     }
-    public static func seedImage(_ account: Provisioning, hostname: String, mac: String, share: SeedShare? = nil) throws -> Data {
+    public static func seedImage(_ account: Provisioning, hostname: String, mac: String, share: SeedShare? = nil, hostKey: HostKey? = nil) throws -> Data {
         try FAT12.image(label: "CIDATA", files: [
-            (name: "user-data", data: Data(try userData(account, hostname: hostname, share: share).utf8)),
+            (name: "user-data", data: Data(try userData(account, hostname: hostname, share: share, hostKey: hostKey).utf8)),
             (name: "meta-data", data: Data(metaData(instanceID: "vmctl-\(hostname)-\(UUID().uuidString.lowercased())", hostname: hostname).utf8)),
             (name: "network-config", data: Data(try networkConfig(mac: mac).utf8))
         ])

@@ -132,6 +132,13 @@ final class DaemonTests: XCTestCase {
             try process.run(); process.waitUntilExit()
             return (process.terminationStatus, String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self))
         }
+        func run(_ tool: String, _ args: [String]) throws -> String {
+            let process = Process(); process.executableURL = URL(fileURLWithPath: tool); process.arguments = args
+            let output = Pipe(); process.standardOutput = output; process.standardError = output
+            try process.run()
+            let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            process.waitUntilExit(); return text
+        }
         let key = CloudInitTests.key
         XCTAssertEqual(try client(["create", "lin"]).0, 1)
         XCTAssertEqual(try client(["create", "lin", "--linux", "--image"]).0, 1)
@@ -243,7 +250,7 @@ final class DaemonTests: XCTestCase {
         let keyFile = root.appendingPathComponent("id.pub")
         try Data("# comment\n\n\(key)\n".utf8).write(to: keyFile)
         let started = try client(["start", "lin", "--iso", iso.path, "--user", "dev", "--full-name", "Developer", "--ssh-key", keyFile.path])
-        XCTAssertEqual(started.0, 0, started.1); XCTAssertEqual(started.1, "running\n")
+        XCTAssertEqual(started.0, 0, started.1); XCTAssertTrue(started.1.hasPrefix("running\n") && started.1.contains("lin.vm"), started.1)
         XCTAssertNoThrow(try Store.check(dir.appendingPathComponent("cloud-init.img")))
         XCTAssertEqual(try client(["status", "lin"]).1, "running\n")
         let busy = try client(["rm", "lin"])
@@ -260,6 +267,34 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(try client(["status", "lin3"]).1, "stopped\n")
         XCTAssertEqual(try client(["stop", "lin", "--force"]).1, "stopped\n")
         XCTAssertEqual(try client(["status", "lin"]).1, "stopped\n")
+        // Provisioning pins a host key generated on the host and writes lin's ssh_config block.
+        let seedBytes = try Data(contentsOf: dir.appendingPathComponent("cloud-init.img"))
+        XCTAssertNotNil(seedBytes.range(of: Data("ed25519_private".utf8)))
+        let pinned = String(decoding: try Store.read(try store.knownHosts("lin")), as: UTF8.self)
+        XCTAssertTrue(pinned.hasPrefix("lin.vm ssh-ed25519 AAAA") && pinned.hasSuffix("\n"), pinned)
+        XCTAssertNotNil(seedBytes.range(of: Data(pinned.split(separator: " ")[2].trimmingCharacters(in: .newlines).utf8)))
+        var sshConfig = String(decoding: try Store.read(store.sshConfig), as: UTF8.self)
+        XCTAssertTrue(sshConfig.contains("Host lin.vm\n  User dev\n"), sshConfig)
+        XCTAssertTrue(sshConfig.contains("IdentityFile \"\(root.appendingPathComponent("id").path)\""), sshConfig)
+        // ssh itself parses the block through an Include, the way ~/.ssh/config will.
+        let includer = root.appendingPathComponent("includer")
+        try Store.write(Data("Include \(store.sshConfig.path)\nHost *\n  ForwardAgent yes\n".utf8), to: includer)
+        let resolved = try run("/usr/bin/ssh", ["-G", "-F", includer.path, "lin.vm"])
+        let linKnownHosts = try store.knownHosts("lin").path
+        XCTAssertTrue(resolved.contains("user dev\n") && resolved.contains("forwardagent no\n") && resolved.contains("stricthostkeychecking true\n")
+                      && resolved.contains("userknownhostsfile \(linKnownHosts)") && resolved.contains(" ip lin)\" 22'"), resolved)
+        // VMs vmctl did not provision need the user and a host key supplied.
+        let noUser = try client(["ssh-config", "lin3"])
+        XCTAssertEqual(noUser.0, 1); XCTAssertTrue(noUser.1.contains("ssh_user_unknown"), noUser.1)
+        let noKey = try client(["ssh-config", "lin3", "--user", "dev"])
+        XCTAssertEqual(noKey.0, 1); XCTAssertTrue(noKey.1.contains("host_key_unknown"), noKey.1)
+        XCTAssertEqual(try client(["ssh-config", "lin3", "--host-key", "ssh-ed25519 bogus"]).0, 1)
+        let manual = try client(["ssh-config", "lin3", "--host-key", key, "--identity", "/tmp/k"])
+        XCTAssertEqual(manual.0, 0, manual.1); XCTAssertTrue(manual.1.hasPrefix("# BEGIN vmctl lin3\nHost lin3.vm\n  User dev\n"), manual.1)
+        let all = try client(["ssh-config"])
+        XCTAssertEqual(all.0, 0, all.1); XCTAssertTrue(all.1.contains("Host lin.vm") && all.1.contains("Host lin3.vm"), all.1)
+        sshConfig = String(decoding: try Store.read(store.sshConfig), as: UTF8.self)
+        XCTAssertEqual(sshConfig.components(separatedBy: "# BEGIN vmctl lin\n").count, 2, sshConfig) // regenerated in place, not duplicated
         config = try JSONDecoder().decode(Configuration.self, from: Store.read(dir.appendingPathComponent("config.json")))
         XCTAssertEqual(config.firstBootAvailable, false)
         let retry = try client(["start", "lin", "--user", "dev", "--ssh-key", key])
@@ -269,11 +304,16 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(try client(["rm"]).0, 1) // never defaults the name
         XCTAssertEqual(try client(["rm", "lin3"]).1, "removed\n")
         XCTAssertThrowsError(try store.existing("lin3"))
+        sshConfig = String(decoding: try Store.read(store.sshConfig), as: UTF8.self)
+        XCTAssertFalse(sshConfig.contains("lin3"), sshConfig); XCTAssertTrue(sshConfig.contains("Host lin.vm"), sshConfig)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try store.knownHosts("lin3").path))
         XCTAssertEqual(try client(["rm", "lin3"]).0, 1)
         XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\tstopped\t-\n")
         let logs = try client(["logs", "lin"]).1
         XCTAssertTrue(logs.contains("linux_vm_created") && logs.contains("starting_with_provisioning") && logs.contains("forced_shutdown"), logs)
         XCTAssertEqual(try client(["rm", "lin"]).1, "removed\n") // last active name, now stopped
+        XCTAssertFalse(String(decoding: try Store.read(store.sshConfig), as: UTF8.self).contains("vmctl lin"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try store.knownHosts("lin").path))
         XCTAssertEqual(try client(["status", "lin"]).0, 1)
         daemon.terminate(); daemon.waitUntilExit()
         XCTAssertEqual(daemon.terminationStatus, 0)
