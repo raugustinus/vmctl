@@ -85,7 +85,7 @@ vmctl stop mac
 `make` builds release binaries and ad-hoc signs them; `SIGN_IDENTITY=... make` uses a
 Developer ID instead. `make test` runs the suite and `make clean` removes `.build`
 and `bin`. `make install` copies both signed binaries into `$(PREFIX)/bin`
-(default `/usr/local`; `make uninstall` removes them). Keep `vmctl` and `vmctld` next
+(default `/usr/local`; `make uninstall` removes them). Both also remove a `vmctld` left by builds before the rename. Keep `vmctl` and `vmd` next
 to each other; a symlink to `vmctl` elsewhere is fine. The Makefile selects SwiftPM's native engine for
 compatibility with older Swift tools and this environment (`BUILD_SYSTEM=` overrides
 it); Swift 6.4 warns that this engine is deprecated. It disables release debug
@@ -139,7 +139,8 @@ console below to enable it in guest System Settings.
 ### Upgrading an already running daemon
 
 Replacing the binary does not replace the running process. First stop your active
-VM with `vmctl stop mac`, then quit your `vmctld` process in Activity Monitor.
+VM with `vmctl stop mac`, then quit the daemon in Activity Monitor or with
+`pkill -TERM -x vmd`. Builds before the rename call it `vmctld`.
 The next CLI call starts the newly signed daemon. Do this **before** creating the
 new VM, so its first-boot eligibility and guest version are recorded. Your existing
 `mac` directory is preserved; use a new name such as `dev` for the new installation.
@@ -318,7 +319,7 @@ an incomplete installation, so `stopped` does not imply it is bootable.
 
 ## Open a local console and enable Screen Sharing
 
-After upgrading, stop the active VM and quit the old `vmctld` process in Activity
+After upgrading, stop the active VM and quit the old daemon (`vmd`, or `vmctld` in older builds) in Activity
 Monitor. Run the updated binaries from Terminal in your logged-in desktop session.
 Restarting the VM supplies the new virtual keyboard and mouse devices. Do not
 repeat `--user` for an already-booted VM.
@@ -387,14 +388,14 @@ An older running daemon must be restarted to understand this option.
 
 Not in the shipping daemon. The attempt, what worked, and the Apple restriction that
 ends it are in `docs/USB-PASSTHROUGH.md`; the retired code is under
-`experiments/usb-passthrough/`. Normal lifecycle and console operation use vmctld
+`experiments/usb-passthrough/`. Normal lifecycle and console operation use vmd
 directly and require no USB provisioning profile.
 
 ## Repository layout
 
 ```text
 Package.swift, Sources/, Tests/   # the SwiftPM package
-Makefile, vmctld.entitlements     # release build/test targets and daemon entitlements
+Makefile, vmd.entitlements     # release build/test targets and daemon entitlements
 completions/_vmctl                # zsh completion, installed by make install
 bin/                              # signed binaries produced by make (gitignored)
 docs/DESIGN.md                    # architecture, storage, security, Apple APIs used

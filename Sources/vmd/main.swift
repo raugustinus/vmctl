@@ -14,7 +14,7 @@ var supervisor: Supervisor!
 var signalSources: [DispatchSourceSignal] = []
 let applicationDelegate = ConsoleApplicationDelegate()
 do {
-    guard CommandLine.arguments.count == 1 else { throw Failure("usage", "vmctld takes no arguments.") }
+    guard CommandLine.arguments.count == 1 else { throw Failure("usage", "vmd takes no arguments.") }
     let store = try Store()
     let lockURL = store.root.appendingPathComponent("daemon.lock")
     retainedLock = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
@@ -37,7 +37,7 @@ do {
     supervisor = Supervisor(store: store)
     // Bound connections so a slow local client cannot grow an unlimited thread backlog.
     let slots = DispatchSemaphore(value: 16)
-    let responses = DispatchQueue(label: "vmctld.responses", attributes: .concurrent)
+    let responses = DispatchQueue(label: "vmd.responses", attributes: .concurrent)
     DispatchQueue.global().async {
         while true {
             let fd = accept(retainedServer, nil, nil)

@@ -14,7 +14,7 @@ final class DaemonTests: XCTestCase {
         // If status opens the image, this FIFO blocks. No valid config exists either.
         XCTAssertEqual(mkfifo(dir.appendingPathComponent("disk.img").path, 0o600), 0)
         var environment = ProcessInfo.processInfo.environment; environment["VMCTL_HOME"] = root.path
-        let daemon = Process(); daemon.executableURL = URL(fileURLWithPath: bin).appendingPathComponent("vmctld")
+        let daemon = Process(); daemon.executableURL = URL(fileURLWithPath: bin).appendingPathComponent("vmd")
         daemon.environment = environment; daemon.standardOutput = FileHandle.nullDevice
         let errors = Pipe(); daemon.standardError = errors
         try daemon.run()
@@ -112,7 +112,7 @@ final class DaemonTests: XCTestCase {
         let root = URL(fileURLWithPath: "/tmp/vmctl-test-\(UUID().uuidString.prefix(8))")
         let store = try Store(root: root)
         var environment = ProcessInfo.processInfo.environment; environment["VMCTL_HOME"] = root.path
-        let daemon = Process(); daemon.executableURL = URL(fileURLWithPath: bin).appendingPathComponent("vmctld")
+        let daemon = Process(); daemon.executableURL = URL(fileURLWithPath: bin).appendingPathComponent("vmd")
         daemon.environment = environment; daemon.standardOutput = FileHandle.nullDevice; daemon.standardError = FileHandle.nullDevice
         try daemon.run()
         defer {

@@ -21,11 +21,11 @@ case "$team_id" in *[!A-Za-z0-9]*|'') echo 'Invalid team identifier.' >&2; exit 
 make
 app="$stage/VMControlUSB.app"
 mkdir -p "$app/Contents/MacOS"
-cp bin/vmctld "$app/Contents/MacOS/vmctld"
+cp bin/vmd "$app/Contents/MacOS/vmd"
 cp USBApp/Info.plist "$app/Contents/Info.plist"
 $plist -c "Set :CFBundleIdentifier $bundle_id" "$app/Contents/Info.plist"
 cp "$USB_PROFILE" "$app/Contents/embedded.provisionprofile"
-cp vmctld.entitlements "$stage/usb.entitlements"
+cp vmd.entitlements "$stage/usb.entitlements"
 $plist -c 'Add :com.apple.developer.accessory-access.usb bool true' "$stage/usb.entitlements"
 $plist -c "Add :com.apple.application-identifier string $app_id" "$stage/usb.entitlements"
 $plist -c "Add :com.apple.developer.team-identifier string $team_id" "$stage/usb.entitlements"

@@ -100,14 +100,14 @@ half is missing today. Options, in order of least work:
 
 1. Install 1Password and create one SSH key per VM in it; set `IdentityAgent` in
    `~/.ssh/config` for the VM hosts. No vmctl change needed.
-2. Teach `vmctld` to be an SSH agent itself: a second private Unix socket speaking the
+2. Teach `vmd` to be an SSH agent itself: a second private Unix socket speaking the
    agent protocol, Secure Enclave P-256 keys created per VM at provisioning time
    (non-exportable, so the key material is unreadable even for the same user), and a
    per-signature approval dialog shown by the daemon, which already runs in the desktop
    session with AppKit. ed25519/P-256 signing is ~150 lines with CryptoKit; the protocol
    subset needed is two messages (identities, sign).
 3. Replace the NAT/DHCP path with vsock: sshd listening on a vsock port in the guest,
-   `vmctld` connecting from the host and passing the connected descriptor to `vmctl ssh`
+   `vmd` connecting from the host and passing the connected descriptor to `vmctl ssh`
    over the control socket (`SCM_RIGHTS`), used as an SSH `ProxyCommand`. Removes the
    lease-file dependency and the network path entirely. Independent of 1 and 2.
 

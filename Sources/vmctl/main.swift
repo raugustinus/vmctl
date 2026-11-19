@@ -118,8 +118,8 @@ func daemonConnection(_ store: Store) throws -> Int32 {
     var bytes = [CChar](repeating: 0, count: Int(size))
     let actual = _NSGetExecutablePath(&bytes, &size) == 0 ? URL(fileURLWithPath: String(cString: bytes)).resolvingSymlinksInPath() : executable
     let bin = actual.deletingLastPathComponent()
-    let daemon = bin.appendingPathComponent("vmctld")
-    guard FileManager.default.isExecutableFile(atPath: daemon.path) else { throw Failure("daemon_missing", "Place signed vmctld beside vmctl.") }
+    let daemon = bin.appendingPathComponent("vmd")
+    guard FileManager.default.isExecutableFile(atPath: daemon.path) else { throw Failure("daemon_missing", "Place signed vmd beside vmctl.") }
     let logURL = store.root.appendingPathComponent("daemon.log")
     let logFD = open(logURL.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
     guard logFD >= 0 else { throw systemFailure("open daemon log") }
@@ -298,7 +298,7 @@ do {
                           share: share, shareReadOnly: shareReadOnly,
                           sshIdentityFile: sshIdentityFile, sshUser: sshUser, hostKey: hostKey), to: fd)
     let response = try Wire.receive(Reply.self, from: fd)
-    let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your running VMs, quit vmctld in Activity Monitor, then retry with the updated daemon.")
+    let upgrade = Failure("daemon_upgrade_required", "The running daemon is an older version. Stop your running VMs, quit the daemon (vmd, or vmctld in older builds) in Activity Monitor, then retry with the updated daemon.")
     if let error = response.error {
         let newer = provisioning != nil || forceStop || ["list", "console", "rm", "ssh-config"].contains(command) || kind != nil || installer != nil
         if newer, error.code == "invalid_command" || (kind != nil && error.code == "restore_required") { throw upgrade }

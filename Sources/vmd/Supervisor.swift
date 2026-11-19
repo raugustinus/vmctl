@@ -5,7 +5,7 @@ import VMCore
 import Darwin
 
 #if !arch(arm64)
-#error("vmctld requires Apple Silicon")
+#error("vmd requires Apple Silicon")
 #endif
 
 /// Live state of one VM. A name without a session is stopped. Sessions stay until `rm`, so an

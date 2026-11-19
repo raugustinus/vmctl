@@ -20,7 +20,7 @@ final class Console: NSObject, NSWindowDelegate {
 
     func show(_ machine: VZVirtualMachine?, name: String) throws {
         guard Thread.isMainThread, Self.hasDesktopSession else {
-            throw Failure("console_unavailable", "Console requires a daemon launched in your logged-in macOS desktop session. Stop the VM and restart vmctld from Terminal in that session.")
+            throw Failure("console_unavailable", "Console requires a daemon launched in your logged-in macOS desktop session. Stop the VM and restart vmd from Terminal in that session.")
         }
         let app = NSApplication.shared
         if app.activationPolicy() != .regular {

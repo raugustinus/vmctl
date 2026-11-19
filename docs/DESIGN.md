@@ -6,7 +6,7 @@ what has been validated. Moved out of the README so that one ends after usage.
 ## Architecture and lifecycle
 
 `vmctl` is a short-lived synchronous socket client. On first use it starts the
-signed sibling `vmctld` with Foundation `Process`, redirects its standard streams,
+signed sibling `vmd` with Foundation `Process`, redirects its standard streams,
 and waits up to five seconds for its private Unix socket. The daemon detaches from
 the terminal with `setsid()`; it never forks a live Virtualization process. It
 stays alive while idle and across independent CLI invocations. It is a per-user
@@ -176,7 +176,7 @@ assuming any IPSW can boot on any host. There is no Intel fallback, nested
 virtualization, or use of private APIs. Newer APIs such as the public
 `VZVirtualMachine.queue` property (macOS 26) are not needed.
 
-Only `vmctld` needs `com.apple.security.virtualization`. Ad-hoc signing suffices
+Only `vmd` needs `com.apple.security.virtualization`. Ad-hoc signing suffices
 for local development. A distribution build should use the appropriate Developer
 ID signing/notarization workflow, which this project does not automate. The
 client has no special entitlements. NAT does not need the restricted bridged

@@ -1,4 +1,4 @@
-# Release build and ad-hoc signing of vmctl and vmctld. No Homebrew, Go, Node,
+# Release build and ad-hoc signing of vmctl and vmd. No Homebrew, Go, Node,
 # Python, or package downloads. Override SIGN_IDENTITY for a Developer ID build.
 SHELL := /bin/sh
 .SHELLFLAGS := -euc
@@ -26,26 +26,27 @@ build: check-arch
 	mkdir -p bin
 	staging=$$(mktemp -d "$(CURDIR)/bin/.staging.XXXXXX"); \
 	trap 'rm -rf "$$staging"' EXIT HUP INT TERM; \
-	cp $(BUILD)/release/vmctl $(BUILD)/release/vmctld "$$staging/"; \
-	codesign --force --sign "$(SIGN_IDENTITY)" --entitlements vmctld.entitlements "$$staging/vmctld"; \
+	cp $(BUILD)/release/vmctl $(BUILD)/release/vmd "$$staging/"; \
+	codesign --force --sign "$(SIGN_IDENTITY)" --entitlements vmd.entitlements "$$staging/vmd"; \
 	codesign --force --sign "$(SIGN_IDENTITY)" "$$staging/vmctl"; \
-	mv -f "$$staging/vmctld" bin/vmctld; \
+	mv -f "$$staging/vmd" bin/vmd; \
 	mv -f "$$staging/vmctl" bin/vmctl
 
 # Copies the already-signed binaries, so `make && sudo make install` never builds
-# as root. Both land in one directory: vmctl finds vmctld beside its own resolved
+# as root. Both land in one directory: vmctl finds vmd beside its own resolved
 # path, so a symlink to BINDIR/vmctl elsewhere (as Homebrew makes) still works.
 # install(1) copies the embedded code signature unchanged.
 install:
-	@[ -x bin/vmctl ] && [ -x bin/vmctld ] || { echo 'Run make first.' >&2; exit 1; }
+	@[ -x bin/vmctl ] && [ -x bin/vmd ] || { echo 'Run make first.' >&2; exit 1; }
 	mkdir -p "$(DESTDIR)$(BINDIR)"
-	install -m 755 bin/vmctld "$(DESTDIR)$(BINDIR)/vmctld"
+	install -m 755 bin/vmd "$(DESTDIR)$(BINDIR)/vmd"
 	install -m 755 bin/vmctl "$(DESTDIR)$(BINDIR)/vmctl"
 	mkdir -p "$(DESTDIR)$(ZSHDIR)"
 	install -m 644 completions/_vmctl "$(DESTDIR)$(ZSHDIR)/_vmctl"
+	rm -f "$(DESTDIR)$(BINDIR)/vmctld" # the daemon's name before it was renamed to vmd
 
 uninstall:
-	rm -f "$(DESTDIR)$(BINDIR)/vmctl" "$(DESTDIR)$(BINDIR)/vmctld" "$(DESTDIR)$(ZSHDIR)/_vmctl"
+	rm -f "$(DESTDIR)$(BINDIR)/vmctl" "$(DESTDIR)$(BINDIR)/vmd" "$(DESTDIR)$(BINDIR)/vmctld" "$(DESTDIR)$(ZSHDIR)/_vmctl"
 
 # Unit tests plus the daemon integration tests against the signed binaries.
 test: build

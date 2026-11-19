@@ -11,7 +11,7 @@ iPhone passthrough is not possible on macOS 27. Contents:
 
 - `USBPassthrough.swift`: the retired `vmctld` source file (imports `AccessoryAccess`).
 - `build-usb.sh` and `USBApp/Info.plist`: the app-bundle build. The script expects
-  to run from the package root beside the `Makefile`, `bin/`, and `vmctld.entitlements`;
+  to run from the package root beside the `Makefile`, `bin/`, and `vmd.entitlements`;
   copy those three files back there to rebuild.
 - `VMControlUSB.app`: the last profile-signed bundle. Built artifact, gitignored.
 - `profile/`: the decoded provisioning profile and its developer certificate
@@ -21,5 +21,5 @@ iPhone passthrough is not possible on macOS 27. Contents:
 
 A standalone AppKit smoke test for the daemon's console window (opens, reuses,
 closes, reopens without a guest). `main.swift` links against the `Console` and
-`ConsoleApplicationDelegate` types from `Sources/vmctld`. The `console-smoke`
+`ConsoleApplicationDelegate` types from `Sources/vmd`. The `console-smoke`
 binary is the last build and is gitignored.

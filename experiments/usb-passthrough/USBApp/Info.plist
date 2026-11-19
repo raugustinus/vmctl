@@ -4,7 +4,7 @@
 <key>CFBundleIdentifier</key><string>local.vmctl.usb</string>
 <key>CFBundleName</key><string>VMControl USB</string>
 <key>CFBundleDisplayName</key><string>VMControl USB</string>
-<key>CFBundleExecutable</key><string>vmctld</string>
+<key>CFBundleExecutable</key><string>vmd</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleVersion</key><string>1</string>
 <key>CFBundleShortVersionString</key><string>0.1</string>
