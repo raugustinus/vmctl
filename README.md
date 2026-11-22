@@ -267,6 +267,32 @@ config (such as `Host *`) turns agent forwarding back on. VMs provisioned before
 this feature, and macOS guests, have no pinned key; `vmctl ssh-config <vm> --user dev
 --host-key <file>` adds one. Run `vmctl help ssh-config` for details.
 
+### Guest console log
+
+Every Linux VM has a virtio console (`hvc0`). The guest's output reaches the Mac
+through it rather than through the guest's disk, so it keeps arriving after the guest
+can no longer read or write its own disk, or when SSH is down:
+
+```sh
+vmctl logs proj --console            # the last ~24 KB
+vmctl logs proj --console --follow   # and everything after it
+```
+
+Provisioning with `--user` sets the guest up to use it. GRUB gets `console=tty0
+console=hvc0`, for kernel messages (disk and filesystem errors among them), boot
+status and the emergency shell's output, and cloud-init reboots the guest once at the
+end of the first boot to apply it; the VM stays running throughout. Journal entries
+at warning and above are forwarded too. Routine service output, logged at info, is
+not: a service whose disk has failed can retry thousands of times a second. Without
+`--user` you only see what the image itself writes there. The output is
+guest-controlled text: vmctl shows control characters as `^X` and drops colour codes,
+so a guest cannot send escape sequences to your terminal.
+
+It is kept in `logs/console.log`, in files of up to 8 MiB. When a run's first file
+fills up it becomes `console.start.log` and is kept until the next run's first file
+replaces it, so the start of a run, often the first error, survives any amount of
+output after it. Later files rotate through `console.log.1`.
+
 ### Direct kernel boot
 
 `--kernel` skips EFI and boots a Linux kernel directly, microVM style:
@@ -275,7 +301,7 @@ this feature, and macOS guests, have no pinned key; `vmctl ssh-config <vm> --use
 vmctl create tiny --linux --kernel "$PWD/Image" --initrd "$PWD/initrd" \
   --image "$PWD/rootfs.ext4" --cpus 1 --memory 512M
 vmctl start tiny                     # returns in about a tenth of a second
-tail -f ~/.vmctl/vms/tiny/logs/console.log
+vmctl logs tiny --console --follow
 ```
 
 The kernel must be an uncompressed arm64 `Image`. Virtualization does not decompress
@@ -288,10 +314,9 @@ filesystem on the disk; pass `--cmdline` to replace it entirely, for example
 appears as `/dev/vdb`.
 
 A kernel-boot VM has no firmware, display, keyboard or pointer: only virtio disk,
-network, entropy and a virtio console (`hvc0`), whose output is appended to
-`logs/console.log`. `console` and `--iso` are refused. The console log is
-output-only and is not rotated. The boot mode, kernel and command line are fixed at
-create time.
+network, entropy and the virtio console (`hvc0`), read with `vmctl logs <name>
+--console`. `console` and `--iso` are refused. The boot mode, kernel and command
+line are fixed at create time.
 
 ## Design notes
 

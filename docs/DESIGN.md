@@ -58,6 +58,16 @@ A client timeout reports uncertainty, not cancellation: query `status` afterward
 - `logs`: returns approximately the last 24 KiB of `logs/daemon.jsonl`, containing
   timestamped lifecycle events and framework failures. It is not guest console
   output and does not stream. Log rotation is not implemented.
+- `logs <name> --console [--follow]`: read by the client straight from
+  `logs/console.log` (and its rotations); the daemon is not involved. Every Linux VM
+  has an output-only virtio console. The guest writes into a pipe, and vmd copies it
+  into the file, starting a new one at 8 MiB, because the guest controls the volume.
+  A run's first full file is kept as `console.start.log`; later ones rotate through
+  `console.log.1`. Output is sanitised before printing: SGR colour codes are dropped
+  and other control characters shown as `^X`. Provisioning adds journald forwarding
+  (warning and above) to `hvc0`, `console=hvc0` on the GRUB command line, and one
+  reboot at the end of the first boot to apply it; Virtualization restarts a
+  rebooting Linux guest in place, so the VM stays running.
 - `rm <name>`: deletes a stopped VM's directory, which is the whole VM: identity,
   firmware/auxiliary stores, disk image, cloud-init seed and logs. It refuses with
   `busy` while that VM is starting, running, stopping, installing or in `error`,
@@ -100,7 +110,9 @@ removes its socket and PID file. It stays alive if shutdown fails.
     cloud-init.img       # Linux, after --user: NoCloud seed (password hash, public key, guest host key, network config)
     disk.img             # writable Virtio block image
     logs/daemon.jsonl
-    logs/console.log     # Linux --kernel boot: virtio console (hvc0) output, appended
+    logs/console.log     # Linux: virtio console (hvc0) output, appended, rotated at 8 MiB
+    logs/console.log.1   # Linux: the previous console log
+    logs/console.start.log  # Linux: the first 8 MiB of the last run that filled one
 ```
 
 The Mac hardware model, machine identifier, auxiliary storage, disk, and MAC must
@@ -132,7 +144,7 @@ Updates replace or remove only that span and keep every other line byte for byte
 the known_hosts files are written atomically: a 0600 temporary file in the same directory,
 fsync, rename. vmctl never opens anything in `~/.ssh`. The IdentityFile path is derived from
 the `--ssh-key` argument (`foo.pub` gives `foo`), not looked up. The guest's host key is
-made on the Mac and handed to cloud-init (`ssh_keys`, with `ssh_genkeytypes: []`), so
+made on the Mac and handed to cloud-init (`ssh_keys`, with `ssh_genkeytypes: [ed25519]`, which generates only missing keys), so
 known_hosts is pinned before the first connection. Its private half sits in the guest's
 seed, readable by the same Unix user like everything else under `~/.vmctl`.
 

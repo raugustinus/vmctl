@@ -18,7 +18,7 @@ _vmctl() {
     'stop:stop a VM'
     'status:show the state of a VM'
     'ip:print the address of a running VM'
-    'logs:print recent supervisor events'
+    'logs:print supervisor events, or a Linux guest console'
     'list:list VMs with state and address'
     'console:open a console window for a running VM'
     'rm:delete a stopped VM'
@@ -51,7 +51,8 @@ _vmctl() {
             '--full-name[full name for --user]:full name:' \
             '--ssh-key[public key, or a .pub file]:public key:_files -g "*.pub(-.)"' ;;
         stop) _arguments '1:VM name:_vmctl_names' '--force[power off immediately]' ;;
-        status|ip|logs|console|rm) _arguments '1:VM name:_vmctl_names' ;;
+        logs) _arguments '1:VM name:_vmctl_names' '--console[guest console output (hvc0)]' '--follow[keep printing new console output]' ;;
+        status|ip|console|rm) _arguments '1:VM name:_vmctl_names' ;;
         ssh-config)
           _arguments \
             '1:VM name:_vmctl_names' \

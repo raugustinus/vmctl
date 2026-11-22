@@ -31,10 +31,26 @@ public enum CloudInit {
             // cloud-init deletes the image's host keys and installs this pair. Generating no other types
             // leaves one host key, the one the host pinned in known_hosts.
             config["ssh_keys"] = ["ed25519_private": hostKey.privateKey, "ed25519_public": hostKey.publicKey]
-            config["ssh_genkeytypes"] = [String]()
+            // Only types whose key file is missing are generated, so this generates nothing. [] would
+            // too, but fails cloud-init's schema (minItems 1) and marks every boot "degraded".
+            config["ssh_genkeytypes"] = ["ed25519"]
             config["ssh_deletekeys"] = true
         }
-        var runcmd: [Any] = []
+        // Send the journal and the kernel console to the virtio console, which the host keeps in
+        // logs/console.log. It is the one log that survives a guest whose disk has failed.
+        // console=hvc0 last makes it /dev/console; tty0 keeps kernel messages on the display.
+        // update-grub applies it from the next boot, so cloud-init reboots once when it is done;
+        // restarting journald applies the rest now. Journal entries go at warning and above only:
+        // services log routine output (and, when their disk fails, endless retries) at info.
+        var writeFiles: [[String: Any]] = [
+            ["path": "/etc/systemd/journald.conf.d/50-vmctl-console.conf",
+             "content": "[Journal]\nForwardToConsole=yes\nTTYPath=/dev/hvc0\nMaxLevelConsole=warning\n"],
+            ["path": "/etc/default/grub.d/99-vmctl-console.cfg",
+             "content": "GRUB_CMDLINE_LINUX=\"$GRUB_CMDLINE_LINUX console=tty0 console=hvc0\"\n"],
+        ]
+        var runcmd: [Any] = [
+            "(command -v update-grub >/dev/null && update-grub >/dev/null 2>&1; systemctl restart systemd-journald) || true",
+        ]
         if let locale = account.locale.flatMap(Provisioning.validLocale) {
             // Not cloud-init's `locale:` key: on Debian it passes the name to locale-gen, which ignores
             // arguments and builds only /etc/locale.gen, so update-locale then fails the whole run.
@@ -51,11 +67,15 @@ public enum CloudInit {
             // fstab mounts it on every later boot (nofail: a missing share never blocks boot);
             // runcmd mounts it on this first boot, after the account and its home exist.
             let options = share.readOnly ? "ro,nofail" : "rw,nofail"
-            config["write_files"] = [["path": "/etc/fstab", "append": true,
-                                      "content": "\(Share.tag) \(mountPoint) virtiofs \(options) 0 0\n"]]
+            writeFiles.append(["path": "/etc/fstab", "append": true,
+                               "content": "\(Share.tag) \(mountPoint) virtiofs \(options) 0 0\n"])
             runcmd += [["mkdir", "-p", mountPoint], ["mount", mountPoint]]
         }
-        if !runcmd.isEmpty { config["runcmd"] = runcmd }
+        config["write_files"] = writeFiles
+        config["runcmd"] = runcmd
+        // Last step of the first boot: Virtualization restarts the VM in place, and vmd keeps it running.
+        config["power_state"] = ["mode": "reboot", "condition": "command -v update-grub >/dev/null",
+                                 "message": "vmctl: rebooting once so the kernel console reaches hvc0"]
         let json = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .withoutEscapingSlashes])
         return "#cloud-config\n" + String(decoding: json, as: UTF8.self) + "\n"
     }

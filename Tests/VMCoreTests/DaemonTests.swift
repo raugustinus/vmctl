@@ -253,6 +253,10 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(started.0, 0, started.1); XCTAssertTrue(started.1.hasPrefix("running\n") && started.1.contains("lin.vm"), started.1)
         XCTAssertNoThrow(try Store.check(dir.appendingPathComponent("cloud-init.img")))
         XCTAssertEqual(try client(["status", "lin"]).1, "running\n")
+        // EFI Linux VMs get the virtio console too. This firmware-only guest writes nothing to it.
+        XCTAssertNoThrow(try Store.check(ConsoleLog.url(in: dir)))
+        let consoleLog = try client(["logs", "lin", "--console"])
+        XCTAssertEqual(consoleLog.0, 0, consoleLog.1)
         let busy = try client(["rm", "lin"])
         XCTAssertEqual(busy.0, 1); XCTAssertTrue(busy.1.contains("busy"), busy.1)
         XCTAssertEqual(try client(["start", "lin"]).1, "running\n")
@@ -311,6 +315,12 @@ final class DaemonTests: XCTestCase {
         XCTAssertEqual(try client(["list"]).1, "NAME\tSTATE\tIP\nlin\tstopped\t-\n")
         let logs = try client(["logs", "lin"]).1
         XCTAssertTrue(logs.contains("linux_vm_created") && logs.contains("starting_with_provisioning") && logs.contains("forced_shutdown"), logs)
+        // A widened ssh_config makes rm fail before anything is deleted, and says how to fix it.
+        XCTAssertEqual(chmod(store.sshConfig.path, 0o644), 0)
+        let refused = try client(["rm", "lin"])
+        XCTAssertEqual(refused.0, 1); XCTAssertTrue(refused.1.contains("chmod 600"), refused.1)
+        XCTAssertNoThrow(try store.existing("lin"))
+        XCTAssertEqual(chmod(store.sshConfig.path, 0o600), 0)
         XCTAssertEqual(try client(["rm", "lin"]).1, "removed\n") // last active name, now stopped
         XCTAssertFalse(String(decoding: try Store.read(store.sshConfig), as: UTF8.self).contains("vmctl lin"))
         XCTAssertFalse(FileManager.default.fileExists(atPath: try store.knownHosts("lin").path))

@@ -43,14 +43,18 @@ final class CloudInitTests: XCTestCase {
         func object(_ text: String) throws -> [String: Any] {
             try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.dropFirst("#cloud-config\n".count).utf8)) as? [String: Any])
         }
-        // Neither: no runcmd, no uid, no write_files, and never cloud-init's own locale key.
+        // Neither: only the console setup, no uid, and never cloud-init's own locale key.
         let plain = try object(CloudInit.userData(Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key), hostname: "lin"))
-        XCTAssertNil(plain["runcmd"]); XCTAssertNil(plain["write_files"]); XCTAssertNil(plain["locale"]); XCTAssertNil(plain["ssh_keys"])
+        XCTAssertEqual((plain["runcmd"] as? [Any])?.count, 1); XCTAssertEqual((plain["write_files"] as? [Any])?.count, 2)
+        XCTAssertNil(plain["locale"]); XCTAssertNil(plain["ssh_keys"])
+        XCTAssertEqual((plain["power_state"] as? [String: String])?["mode"], "reboot")
+        let journald = (plain["write_files"] as? [[String: Any]])?.first?["content"] as? String
+        XCTAssertTrue(journald?.contains("MaxLevelConsole=warning") == true, journald ?? "")
         // A host-generated host key replaces the image's keys, and no other key types are generated.
         let keyed = try object(CloudInit.userData(Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key), hostname: "lin",
                                                   hostKey: CloudInit.HostKey(privateKey: "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n", publicKey: Self.key)))
         XCTAssertEqual(keyed["ssh_keys"] as? [String: String], ["ed25519_private": "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----\n", "ed25519_public": Self.key])
-        XCTAssertEqual(keyed["ssh_genkeytypes"] as? [String], []); XCTAssertEqual(keyed["ssh_deletekeys"] as? Bool, true)
+        XCTAssertEqual(keyed["ssh_genkeytypes"] as? [String], ["ed25519"]); XCTAssertEqual(keyed["ssh_deletekeys"] as? Bool, true)
         XCTAssertNil((plain["users"] as? [[String: Any]])?.first?["uid"])
 
         let account = Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key, locale: "en_US.UTF-8")
@@ -59,18 +63,18 @@ final class CloudInitTests: XCTestCase {
         XCTAssertNil(both["locale"])
         XCTAssertEqual((both["users"] as? [[String: Any]])?.first?["uid"] as? Int, 501)
         let files = try XCTUnwrap(both["write_files"] as? [[String: Any]])
-        XCTAssertEqual(files.first?["path"] as? String, "/etc/fstab"); XCTAssertEqual(files.first?["append"] as? Bool, true)
-        XCTAssertEqual(files.first?["content"] as? String, "vmctl /home/dev/unia virtiofs rw,nofail 0 0\n")
+        XCTAssertEqual(files.last?["path"] as? String, "/etc/fstab"); XCTAssertEqual(files.last?["append"] as? Bool, true)
+        XCTAssertEqual(files.last?["content"] as? String, "vmctl /home/dev/unia virtiofs rw,nofail 0 0\n")
         let runcmd = try XCTUnwrap(both["runcmd"] as? [Any])
-        XCTAssertEqual(runcmd.count, 3)
-        let localeStep = try XCTUnwrap(runcmd.first as? String)
+        XCTAssertEqual(runcmd.count, 4)
+        let localeStep = try XCTUnwrap(runcmd[1] as? String)
         XCTAssertTrue(localeStep.hasPrefix("(") && localeStep.hasSuffix(")"), localeStep) // a subshell: its exit skips nothing else
         XCTAssertTrue(localeStep.contains("echo 'en_US.UTF-8 UTF-8' >> /etc/locale.gen") && localeStep.contains("locale-gen en_US.UTF-8"), localeStep)
-        XCTAssertEqual(runcmd[1] as? [String], ["mkdir", "-p", "/home/dev/unia"])
-        XCTAssertEqual(runcmd[2] as? [String], ["mount", "/home/dev/unia"])
+        XCTAssertEqual(runcmd[2] as? [String], ["mkdir", "-p", "/home/dev/unia"])
+        XCTAssertEqual(runcmd[3] as? [String], ["mount", "/home/dev/unia"])
 
         let readOnly = try object(CloudInit.userData(account, hostname: "lin", share: CloudInit.SeedShare(name: "p", readOnly: true, hostUID: 501)))
-        XCTAssertEqual((readOnly["write_files"] as? [[String: Any]])?.first?["content"] as? String, "vmctl /home/dev/p virtiofs ro,nofail 0 0\n")
+        XCTAssertEqual((readOnly["write_files"] as? [[String: Any]])?.last?["content"] as? String, "vmctl /home/dev/p virtiofs ro,nofail 0 0\n")
     }
 
     // Minimal FAT12 reader used only to verify what the writer produced.

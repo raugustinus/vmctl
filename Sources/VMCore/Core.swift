@@ -230,9 +230,15 @@ public struct Store {
     public static func check(_ url: URL, directory: Bool = false) throws {
         var s = stat()
         guard lstat(url.path, &s) == 0 else { throw systemFailure("stat \(url.lastPathComponent)") }
-        guard s.st_uid == getuid(), s.st_mode & 0o077 == 0,
-              s.st_mode & S_IFMT == (directory ? S_IFDIR : S_IFREG), directory || s.st_nlink == 1 else {
-            throw Failure("unsafe_path", "Expected a private, user-owned \(directory ? "directory" : "regular file") at \(url.path); symlinks and hard-linked files are rejected.")
+        let kind = directory ? "directory" : "regular file"
+        guard s.st_uid == getuid() else {
+            throw Failure("unsafe_path", "\(url.path) is not owned by you.")
+        }
+        guard s.st_mode & S_IFMT == (directory ? S_IFDIR : S_IFREG), directory || s.st_nlink == 1 else {
+            throw Failure("unsafe_path", "Expected a \(kind) at \(url.path); symlinks and hard-linked files are rejected.")
+        }
+        guard s.st_mode & 0o077 == 0 else {
+            throw Failure("unsafe_path", "\(url.path) is readable or writable by other users (mode \(String(s.st_mode & 0o777, radix: 8))); run chmod \(directory ? 700 : 600) on it.")
         }
     }
     public func vm(_ name: String) throws -> URL {

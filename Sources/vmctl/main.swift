@@ -13,6 +13,7 @@ func usage() {
                                 [--share /path/to/project[:ro]]
            vmctl start [name] [--iso /path/to/installer.iso]
            vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
+           vmctl logs [name] [--console [--follow]]
            vmctl stop [name] --force
            vmctl ssh-config [name] [--user <user>] [--host-key <key-or-file>] [--identity <private-key>]
            vmctl help [ssh-config]
@@ -20,8 +21,8 @@ func usage() {
     create --linux prepares an EFI Linux VM with a blank sparse disk, or a copy of a raw image.
     --disk sets the Linux disk size: 40G, 512M, 1T (bare numbers are GiB). Default 20 GiB, sparse.
     --cpus and --memory size a Linux VM, e.g. --cpus 1 --memory 512M (bare numbers are GiB). Default 4 CPUs, 8 GiB.
-    --kernel boots an uncompressed arm64 Image directly: no EFI, display or console window. Guest output
-    (hvc0) goes to ~/.vmctl/vms/<name>/logs/console.log. Default --cmdline: "\(KernelBoot.defaultCommandLine)".
+    --kernel boots an uncompressed arm64 Image directly: no EFI, display or console window.
+    Default --cmdline: "\(KernelBoot.defaultCommandLine)".
     --share attaches a host directory over virtiofs at every boot (:ro for read-only). With start --user it is
     mounted at ~<user>/<directory name> in the guest; the guest can change everything in it, nothing outside.
     start --iso attaches an installer ISO (Linux only) for this boot; install it from console.
@@ -33,9 +34,67 @@ func usage() {
     Default name: mac. stop waits up to 30 seconds for guest shutdown before forcing power-off.
     stop --force powers off immediately; unsaved guest data may be lost.
     logs prints the last ~24 KB of supervisor events. Errors are JSON on stderr.
+    logs --console prints the last ~24 KB of a Linux guest's virtio console (hvc0): for VMs provisioned
+    with --user, kernel messages and journal warnings and errors. It keeps working when the guest's disk
+    does not. --follow keeps printing new output. Control characters are shown as ^X. Kept in
+    ~/.vmctl/vms/<name>/logs/: console.log, console.log.1, and console.start.log, the start of the run.
     console opens a local window for a running VM; closing it keeps the VM running.
     rm deletes a stopped VM's directory (disk, identity, logs); it cannot be undone.
     """)
+}
+/// Prints the last ~24 KB of a Linux VM's console log, then with `follow` keeps printing what the
+/// guest writes, across rotations. Read directly from the store; the daemon is not involved.
+func showConsoleLog(_ vmDirectory: URL, follow: Bool) throws -> Never {
+    let url = ConsoleLog.url(in: vmDirectory)
+    let tail: off_t = 24_000
+    var fd: Int32 = -1, inode: ino_t = 0, offset: off_t = 0
+    func reopen(fromEnd: Bool) -> Bool {
+        if fd >= 0 { close(fd); fd = -1 }
+        var info = stat()
+        guard lstat(url.path, &info) == 0, (try? Store.check(url)) != nil else { return false }
+        fd = open(url.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard fd >= 0, fstat(fd, &info) == 0 else { return false }
+        inode = info.st_ino
+        offset = fromEnd && info.st_size > tail ? info.st_size - tail : 0
+        return true
+    }
+    func drain(skipPartialLine: Bool) {
+        var buffer = [UInt8](repeating: 0, count: 65536), data = Data()
+        while true {
+            let count = pread(fd, &buffer, buffer.count, offset)
+            if count <= 0 { break }
+            data.append(buffer, count: count); offset += off_t(count)
+        }
+        if skipPartialLine, let newline = data.firstIndex(of: 0x0A) { data = data[(newline + 1)...] }
+        if !data.isEmpty { FileHandle.standardOutput.write(Data(ConsoleLog.printable(data).utf8)) }
+    }
+    func followLoop() -> Never {
+        while true {
+            drain(skipPartialLine: false)
+            var info = stat()
+            // Rotated: the old file is finished above; continue at the start of the new one.
+            if lstat(url.path, &info) == 0, info.st_ino != inode, reopen(fromEnd: false) { continue }
+            usleep(250_000)
+        }
+    }
+    guard reopen(fromEnd: true) else {
+        var info = stat()
+        if lstat(url.path, &info) == 0 { try Store.check(url) } // reports why it was refused
+        if !follow { throw Failure("not_found", "No console log yet. It is written while a Linux VM runs.") }
+        while !reopen(fromEnd: false) { usleep(500_000) }
+        followLoop()
+    }
+    drain(skipPartialLine: offset > 0)
+    if follow { followLoop() }
+    exit(0)
+}
+func alignColumns(_ text: String) -> String {
+    let rows = text.split(separator: "\n", omittingEmptySubsequences: false).map { $0.split(separator: "\t", omittingEmptySubsequences: false).map(String.init) }
+    var widths: [Int] = []
+    for row in rows { for (i, cell) in row.enumerated() { if i >= widths.count { widths.append(0) }; widths[i] = max(widths[i], cell.count) } }
+    return rows.map { row in
+        row.enumerated().map { i, cell in i == row.count - 1 ? cell : cell.padding(toLength: widths[i] + 2, withPad: " ", startingAt: 0) }.joined()
+    }.joined(separator: "\n")
 }
 func sshConfigHelp() {
     print("""
@@ -248,6 +307,12 @@ do {
             default: throw Failure("usage", "Use vmctl ssh-config [name] [--user <user>] [--identity <private-key-path>] [--host-key <key-or-file>].")
             }
         }
+    case "logs" where args.first == "--console":
+        args.removeFirst()
+        let follow = args == ["--follow"] || args == ["-f"]
+        guard args.isEmpty || follow else { throw Failure("usage", "Use vmctl logs [name] [--console [--follow]].") }
+        try showConsoleLog(try Store().existing(name), follow: follow)
+        exit(0)
     case "stop":
         if args == ["--force"] { forceStop = true } else if !args.isEmpty { throw Failure("usage", "Use vmctl stop [name] [--force].") }
     case "start":
@@ -320,7 +385,11 @@ do {
         }
     }
 
-    if let value = response.value, !value.isEmpty { print(value) }
+    if let value = response.value, !value.isEmpty {
+        // Tab-separated for scripts and completion; padded columns on a terminal, where a name
+        // longer than one tab stop would otherwise push its row out of line.
+        print(command == "list" && isatty(STDOUT_FILENO) == 1 ? alignColumns(value) : value)
+    }
     if provisioning != nil {
         let saved = try JSONDecoder().decode(Configuration.self, from: Store.read(try store.vm(name).appendingPathComponent("config.json")))
         if saved.isLinux {

@@ -169,6 +169,24 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         }
         return url
     }
+    /// The guest writes into a pipe; vmd copies it into the capped console log. The handler keeps the
+    /// read end alive; the configuration holds the write end, so the copy ends by itself (EOF) once the
+    /// VM and its configuration are gone. A configuration built only for validation never writes.
+    static func consoleAttachment(_ url: URL) throws -> VZFileHandleSerialPortAttachment {
+        let log = try ConsoleLog(url: url)
+        let pipe = Pipe(), reader = pipe.fileHandleForReading
+        var marked = false
+        reader.readabilityHandler = { _ in
+            let data = reader.availableData
+            if data.isEmpty { reader.readabilityHandler = nil; return } // EOF: releases the reader and the log
+            if !marked {
+                marked = true
+                log.append(Data("\n--- vmd: boot at \(ISO8601DateFormatter().string(from: Date())) ---\n".utf8))
+            }
+            log.append(data)
+        }
+        return VZFileHandleSerialPortAttachment(fileHandleForReading: nil, fileHandleForWriting: pipe.fileHandleForWriting)
+    }
     func configuration(_ name: String, allowIncomplete: Bool = false, installer: URL? = nil) throws -> VZVirtualMachineConfiguration {
         let (dir, saved) = try saved(name)
         guard saved.version == 1, saved.name == name, saved.installed || allowIncomplete else {
@@ -198,11 +216,6 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 if lstat(initrd.path, &info) == 0 { try Store.check(initrd); loader.initialRamdiskURL = initrd }
                 loader.commandLine = commandLine
                 config.bootLoader = loader
-                let log = dir.appendingPathComponent("logs").appendingPathComponent("console.log")
-                if lstat(log.path, &info) == 0 { try Store.check(log) }
-                let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
-                serial.attachment = try VZFileSerialPortAttachment(url: log, append: true)
-                config.serialPorts = [serial]
             } else {
                 let variables = dir.appendingPathComponent("efi-variable-store")
                 try Store.check(variables)
@@ -221,6 +234,10 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 storage.append(VZUSBMassStorageDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: installer, readOnly: true)))
             }
             config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
+            // Every Linux VM gets a virtio console (hvc0), output only, kept in logs/console.log.
+            let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
+            serial.attachment = try Self.consoleAttachment(ConsoleLog.url(in: dir))
+            config.serialPorts = [serial]
             if let share = saved.share {
                 // Checked at every boot: a moved or deleted project directory fails the start, not the mount.
                 let directory = VZSharedDirectory(url: try Self.shareDirectory(share), readOnly: saved.shareReadOnly == true)
@@ -279,7 +296,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             switch request.command {
             case "console":
                 if (try? saved(request.name))?.1.bootsKernel == true {
-                    throw Failure("console_unavailable", "Kernel-boot VMs have no display. Guest console output (hvc0) is written to ~/.vmctl/vms/\(request.name)/logs/console.log.")
+                    throw Failure("console_unavailable", "Kernel-boot VMs have no display. Read guest console output (hvc0) with vmctl logs \(request.name) --console, or in ~/.vmctl/vms/\(request.name)/logs/console.log.")
                 }
                 guard let current, current.phase == "running", let vm = current.machine else {
                     throw Failure("not_running", "Start this VM before opening its console.")
@@ -394,11 +411,13 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 if let current, current.machine != nil || current.phase != "stopped" {
                     throw Failure("busy", "VM \(request.name) is \(current.phase); stop it before removing it.")
                 }
+                // SSH entries first: if they cannot be removed, the VM is still intact and the
+                // error is accurate. `vmctl ssh-config NAME` recreates them if the delete then fails.
+                _ = try store.updateSSHConfig(name: request.name, block: nil)
+                try store.removeKnownHosts(name: request.name)
                 // The directory is the whole VM: identity, EFI/auxiliary stores, disk, seed and logs.
                 try FileManager.default.removeItem(at: dir)
                 sessions[request.name] = nil
-                try store.updateSSHConfig(name: request.name, block: nil)
-                try store.removeKnownHosts(name: request.name)
                 reply(Reply(value: "removed"))
             case "status":
                 // No disk/config/image reads. The private VM directory only establishes existence.
