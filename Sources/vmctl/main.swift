@@ -16,6 +16,8 @@ func usage() {
            vmctl logs [name] [--console [--follow]]
            vmctl stop [name] --force
            vmctl ssh-config [name] [--user <user>] [--host-key <key-or-file>] [--identity <private-key>]
+           vmctl mount <name> [<guest-directory> [<mount-point>]]
+           vmctl umount <name> [<mount-point>] [--force]
            vmctl help [ssh-config]
     create --restore installs a local Apple restore image; it may take a long time.
     create --linux prepares an EFI Linux VM with a blank sparse disk, or a copy of a raw image.
@@ -30,6 +32,12 @@ func usage() {
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
     A Linux VM started with --user becomes <name>.vm in ~/.vmctl/ssh_config, with a pinned host key;
     see vmctl help ssh-config.
+    mount puts a directory of a running Linux guest on this Mac, read-write, over NFS: the reverse of
+    --share. The files stay on the guest's disk and the guest sees nothing of the Mac. Default mount point:
+    ~/vm/<name>/<directory name>. The guest (started with --user) is set up over SSH the first time: an NFS
+    export of that directory to this Mac's address only, with files written from here owned by that account.
+    mount <name> alone lists that VM's mounts. They are unmounted by stop and rm and mounted again by start.
+    umount unmounts one or all and forgets them; --force also when files are still open.
     --dns (Linux only, with --user) makes the guest use that DNS server instead of the NAT gateway's.
     vmd answers <name>.vm with a running VM's address on 127.0.0.1:\(NameService.port) (UDP); point a resolver's
     vm zone at it, e.g. dnsmasq: server=/vm/127.0.0.1#\(NameService.port). See the README.
@@ -242,6 +250,172 @@ func parseSize(_ text: String, flag: String = "--disk") throws -> UInt64 {
     }
     return count * unit
 }
+/// Runs a program to its end with stdin from `input` (or /dev/null) and returns what it printed.
+func run(_ executable: String, _ arguments: [String], input: String? = nil) -> (status: Int32, output: String, errors: String) {
+    let process = Process(), out = Pipe(), err = Pipe(), stdin = Pipe()
+    process.executableURL = URL(fileURLWithPath: executable); process.arguments = arguments
+    process.standardOutput = out; process.standardError = err
+    process.standardInput = input == nil ? FileHandle.nullDevice : stdin
+    guard (try? process.run()) != nil else { return (127, "", "cannot run \(executable)") }
+    if let input { stdin.fileHandleForWriting.write(Data(input.utf8)); stdin.fileHandleForWriting.closeFile() }
+    let output = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    let errors = String(decoding: err.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+    process.waitUntilExit()
+    return (process.terminationStatus, output, errors.trimmingCharacters(in: .whitespacesAndNewlines))
+}
+/// One request to the daemon, for commands that need its answer as a step of their own work.
+func daemonValue(_ store: Store, command: String, name: String) throws -> String {
+    let fd = try daemonConnection(store); defer { close(fd) }
+    Wire.timeout(fd, seconds: 30)
+    try Wire.send(Request(command: command, name: name), to: fd)
+    let reply = try Wire.receive(Reply.self, from: fd)
+    if let error = reply.error { throw error }
+    return reply.value ?? ""
+}
+/// What is mounted at `path`, if `path` is itself a mount point: the file system type and its source.
+func mountedAt(_ path: String) -> (type: String, source: String)? {
+    var info = statfs()
+    guard statfs(path, &info) == 0 else { return nil }
+    func text<T>(_ tuple: T) -> String { withUnsafeBytes(of: tuple) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) } }
+    guard text(info.f_mntonname) == URL(fileURLWithPath: path).standardizedFileURL.path else { return nil }
+    return (text(info.f_fstypename), text(info.f_mntfromname))
+}
+/// Runs a script in the guest as root, over SSH with vmctl's own ssh_config: the pinned host key
+/// and the --user account, whatever ~/.ssh/config says.
+func runInGuest(_ store: Store, _ name: String, script: String) throws {
+    let result = run("/usr/bin/ssh", ["-T", "-F", store.sshConfig.path, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+                                      SSHConfig.host(name), GuestMount.remoteCommand], input: script)
+    guard result.status == 0 else {
+        let reason = result.errors.isEmpty ? "ssh exited with status \(result.status)" : result.errors
+        throw Failure("guest_setup_failed", "Could not set up the export in the guest: \(reason)")
+    }
+}
+func mountGuestDirectory(_ record: GuestMount.Record, address: String) throws {
+    if let mounted = mountedAt(record.mountPoint) {
+        guard mounted.type == "nfs", mounted.source.hasSuffix(":" + record.guestPath) else {
+            throw Failure("mount_point_in_use", "\(record.mountPoint) has \(mounted.source) mounted on it.")
+        }
+        return
+    }
+    try FileManager.default.createDirectory(atPath: record.mountPoint, withIntermediateDirectories: true)
+    let contents = (try? FileManager.default.contentsOfDirectory(atPath: record.mountPoint)) ?? []
+    guard contents.filter({ $0 != ".DS_Store" }).isEmpty else {
+        throw Failure("mount_point_in_use", "\(record.mountPoint) is not empty. Mount on an empty directory.")
+    }
+    let result = run("/sbin/mount_nfs", try GuestMount.mountArguments(address: address, guestPath: record.guestPath, mountPoint: record.mountPoint))
+    guard result.status == 0 else { throw Failure("mount_failed", result.errors.isEmpty ? "mount_nfs exited with status \(result.status)." : result.errors) }
+}
+/// Unmounts; with `force` also when files are open or the guest no longer answers. True when
+/// nothing is mounted there afterwards.
+func unmountGuestDirectory(_ record: GuestMount.Record, force: Bool) -> (done: Bool, reason: String) {
+    guard mountedAt(record.mountPoint) != nil else { return (true, "") }
+    var result = run("/sbin/umount", [record.mountPoint])
+    if result.status != 0, force { result = run("/sbin/umount", ["-f", record.mountPoint]) }
+    return (result.status == 0, result.errors)
+}
+/// The address of a running VM once it has one and answers on the NFS port, within `seconds`.
+func waitForNFS(_ store: Store, _ name: String, seconds: Int) -> String? {
+    for _ in 0..<seconds {
+        if let address = try? daemonValue(store, command: "ip", name: name), !address.isEmpty,
+           run("/usr/bin/nc", ["-z", "-G", "1", address, "2049"]).status == 0 { return address }
+        sleep(1)
+    }
+    return nil
+}
+func warn(_ text: String) { FileHandle.standardError.write(Data((text + "\n").utf8)) }
+
+/// `vmctl mount` and `vmctl umount`: done here, with ssh, mount_nfs and umount; the daemon only says
+/// where the VM is.
+func mountCommand(_ store: Store, _ name: String, _ arguments: [String]) throws {
+    let directory = try store.existing(name)
+    var records = try GuestMount.records(in: directory)
+    if arguments.isEmpty {
+        if records.isEmpty { print("No mounts. vmctl mount \(name) <guest-directory> [<mount-point>]") }
+        for record in records {
+            print("\(record.guestPath)\t\(record.mountPoint)\t\(mountedAt(record.mountPoint) == nil ? "not mounted" : "mounted")")
+        }
+        return
+    }
+    guard arguments.count <= 2, !arguments.contains(where: { $0.hasPrefix("--") }) else {
+        throw Failure("usage", "Use vmctl mount <name> [<guest-directory> [<mount-point>]].")
+    }
+    let saved = try JSONDecoder().decode(Configuration.self, from: Store.read(directory.appendingPathComponent("config.json")))
+    guard saved.isLinux, saved.sshUser != nil else {
+        throw Failure("mount_unsupported", "mount needs a Linux VM started with --user: vmctl sets the export up over SSH as that account.")
+    }
+    let guestPath = try GuestMount.validate(guestPath: arguments[0])
+    let home = FileManager.default.homeDirectoryForCurrentUser.path
+    let mountPoint = arguments.count == 2 ? absolute(arguments[1]) : GuestMount.defaultMountPoint(home: home, name: name, guestPath: guestPath)
+    try GuestMount.validate(mountPoint: mountPoint, home: home, store: store.root.path)
+    let record = GuestMount.Record(guestPath: guestPath, mountPoint: mountPoint)
+    records = try GuestMount.adding(record, to: records)
+
+    let address = try daemonValue(store, command: "ip", name: name)
+    try runInGuest(store, name, script: try GuestMount.exportScript(guestPath: guestPath))
+    try mountGuestDirectory(record, address: address)
+    try GuestMount.save(records, in: directory)
+    print("\(SSHConfig.host(name)):\(guestPath) is mounted on \(mountPoint)")
+    print("It is unmounted by vmctl stop and mounted again by vmctl start.")
+    if FileManager.default.fileExists(atPath: mountPoint + "/.git") {
+        print("git refuses a repository whose files belong to another user until you allow it:\n    git config --global --add safe.directory \(mountPoint)")
+    }
+}
+func umountCommand(_ store: Store, _ name: String, _ arguments: [String]) throws {
+    var arguments = arguments
+    let force = arguments.last == "--force"
+    if force { arguments.removeLast() }
+    guard arguments.count <= 1, !arguments.contains(where: { $0.hasPrefix("--") }) else {
+        throw Failure("usage", "Use vmctl umount <name> [<mount-point>] [--force].")
+    }
+    let directory = try store.existing(name)
+    let records = try GuestMount.records(in: directory)
+    let wanted = arguments.first.map { absolute($0) }
+    let chosen = records.filter { wanted == nil || $0.mountPoint == wanted }
+    guard !chosen.isEmpty else {
+        throw Failure("not_mounted", wanted.map { "\($0) is not a mount of \(name). See vmctl mount \(name)." } ?? "\(name) has no mounts.")
+    }
+    var remaining = records
+    for record in chosen {
+        let result = unmountGuestDirectory(record, force: force)
+        guard result.done else {
+            try GuestMount.save(remaining, in: directory)
+            throw Failure("unmount_failed", "\(record.mountPoint): \(result.reason). Close what has files open there, or add --force.")
+        }
+        remaining.removeAll { $0 == record }
+        // The export goes too, when the guest can be reached; a stopped guest keeps a harmless file.
+        if (try? daemonValue(store, command: "ip", name: name)) != nil,
+           let script = try? GuestMount.unexportScript(guestPath: record.guestPath) { try? runInGuest(store, name, script: script) }
+        print("Unmounted \(record.mountPoint)")
+    }
+    try GuestMount.save(remaining, in: directory)
+}
+/// Before a VM stops or is removed: its directories leave this Mac first. A mount whose server is
+/// gone makes every program that looks at it wait, so this is forced; files still open there get
+/// an error, as they would from the guest going away.
+func unmountBeforeStop(_ store: Store, _ name: String) {
+    guard let directory = try? store.existing(name), let records = try? GuestMount.records(in: directory) else { return }
+    for record in records where mountedAt(record.mountPoint) != nil {
+        let result = unmountGuestDirectory(record, force: true)
+        if !result.done { warn("Could not unmount \(record.mountPoint): \(result.reason)") }
+    }
+}
+/// After a VM started: its recorded directories come back. Never an error of start itself.
+func mountAfterStart(_ store: Store, _ name: String) {
+    guard let directory = try? store.existing(name), let records = try? GuestMount.records(in: directory), !records.isEmpty else { return }
+    guard let address = waitForNFS(store, name, seconds: 120) else {
+        warn("\(name) did not answer on the NFS port within two minutes; its directories are not mounted. Try: vmctl mount \(name) <guest-directory> <mount-point>")
+        return
+    }
+    for record in records {
+        do {
+            // The guest may have a new address, and the export names this Mac's: write it again.
+            try runInGuest(store, name, script: try GuestMount.exportScript(guestPath: record.guestPath))
+            try mountGuestDirectory(record, address: address)
+            print("Mounted \(SSHConfig.host(name)):\(record.guestPath) on \(record.mountPoint)")
+        } catch { warn("Could not mount \(record.guestPath) on \(record.mountPoint): \(Failure.wrapping(error).message)") }
+    }
+}
+
 umask(0o077)
 
 signal(SIGPIPE, SIG_IGN)
@@ -257,12 +431,15 @@ do {
         }
         exit(0)
     }
-    guard ["create", "start", "stop", "status", "ip", "logs", "list", "console", "rm", "ssh-config"].contains(command) else { throw Failure("usage", "Unknown command. Run vmctl --help.") }
+    guard ["create", "start", "stop", "status", "ip", "logs", "list", "console", "rm", "ssh-config", "mount", "umount"].contains(command) else { throw Failure("usage", "Unknown command. Run vmctl --help.") }
     if command == "list", !args.isEmpty { throw Failure("usage", "Usage: vmctl list (no arguments).") }
     var name = command == "ssh-config" ? "" : "mac" // ssh-config without a name covers every VM.
     if let first = args.first, !first.hasPrefix("--") { name = args.removeFirst() }
     else if command == "rm" { throw Failure("usage", "Usage: vmctl rm <name>. The name is never defaulted for removal.") }
+    else if command == "mount" || command == "umount" { throw Failure("usage", "Usage: vmctl \(command) <name> ... The name is never defaulted for mounts.") }
     if !name.isEmpty { try validateName(name) }
+    if command == "mount" { try mountCommand(try Store(), name, args); exit(0) }
+    if command == "umount" { try umountCommand(try Store(), name, args); exit(0) }
     var restore: String?, kind: String?, image: String?, installer: String?, diskSize: UInt64?, cpuCount: Int?, memorySize: UInt64?
     var kernel: String?, initrd: String?, kernelCommandLine: String?, share: String?, shareReadOnly: Bool?
     var provisioning: Provisioning?
@@ -358,6 +535,7 @@ do {
     }
 
     let store = try Store()
+    if command == "stop" || command == "rm" { unmountBeforeStop(store, name) }
     let fd = try daemonConnection(store); defer { close(fd) }
     Wire.timeout(fd, seconds: command == "create" ? 86400 : 120)
     try Wire.send(Request(command: forceStop ? "force-stop" : (provisioning == nil ? command : "provision"), name: name,
@@ -406,6 +584,7 @@ do {
     } else if command == "ssh-config", !name.isEmpty {
         print(sshReachability(name, store: store))
     }
+    if command == "start" { mountAfterStart(store, name) }
 } catch {
     let reply = Reply(error: Failure.wrapping(error))
     if let data = try? JSONEncoder().encode(reply) { FileHandle.standardError.write(data); FileHandle.standardError.write(Data([10])) }

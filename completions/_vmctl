@@ -23,6 +23,8 @@ _vmctl() {
     'console:open a console window for a running VM'
     'rm:delete a stopped VM'
     'ssh-config:write and print the <name>.vm ssh_config entry'
+    'mount:mount a directory of a Linux guest on this Mac'
+    'umount:unmount a guest directory and forget it'
     'help:show usage, or help ssh-config'
   )
   _arguments -C '1:command:->command' '*::argument:->argument' && return
@@ -60,6 +62,8 @@ _vmctl() {
             '--user[guest account, for VMs provisioned before ssh-config]:account name:' \
             '--host-key[guest host public key, or a .pub file]:host key:_files' \
             '--identity[private key for IdentityFile]:private key:_files' ;;
+        mount) _arguments '1:VM name:_vmctl_names' '2:directory in the guest:' '3:mount point:_files -/' ;;
+        umount) _arguments '1:VM name:_vmctl_names' '2:mount point:_files -/' '--force[also when files are still open]' ;;
         help) _arguments '1:topic:(ssh-config)' ;;
       esac ;;
   esac

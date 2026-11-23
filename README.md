@@ -238,6 +238,37 @@ at every start, so a moved or deleted project directory makes `start` fail with
 `invalid_share` instead of booting without it. VMs created before `--share` have no
 share; create a new one, which takes seconds from the APFS-cloned image.
 
+### Mount a guest directory on the Mac
+
+The reverse of `--share`: the files live on the guest's disk, the guest sees nothing of
+the Mac, and the Mac reads and writes them, for an editor or IDE that runs here.
+
+```sh
+vmctl mount proj /home/dev/src/project            # on ~/vm/proj/project
+vmctl mount proj /home/dev/src/project ~/code/project-vm
+vmctl mount proj                                  # what is mounted
+vmctl umount proj [<mount-point>] [--force]       # unmount and forget
+```
+
+It needs a running Linux VM started with `--user`. The first time, vmctl sets the guest
+up over SSH as that account (which has passwordless sudo): it installs the NFS server
+where it is missing and `apt-get` exists, and exports that one directory to the address
+this Mac has on the VM network, and to no other. Every access from the Mac is mapped to
+the account, so files written here belong to it in the guest. On the Mac the directory
+is mounted with NFSv3 from an unprivileged port, so no `sudo` is needed; `soft,intr`
+makes a guest that is gone an error instead of a hang, and nothing in it is trusted as a
+device or a setuid program.
+
+`vmctl stop` and `vmctl rm` unmount first, forcibly: a mount whose server is gone makes
+every program that looks at it wait. `vmctl start` mounts again what was mounted, also
+when the guest came back with another address. `umount` removes the export in the guest
+when it can be reached.
+
+Things a network mount does not do: file-change events do not reach the Mac, so an IDE
+sees what was changed inside the guest when it refreshes; and git refuses a repository
+whose files belong to another user until you allow it (`vmctl mount` prints the line).
+Guest paths are limited to letters, digits, `.`, `_`, `-` and `/`.
+
 ### Reach VMs by name with ssh and git
 
 Provisioning a Linux VM (`start --user`) adds a `Host <name>.vm` block to
