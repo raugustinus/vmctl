@@ -197,7 +197,13 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         try Store.check(disk)
         let config = VZVirtualMachineConfiguration()
         config.cpuCount = saved.cpuCount; config.memorySize = saved.memorySize
-        var storage: [VZStorageDeviceConfiguration] = [VZVirtioBlockDeviceConfiguration(attachment: try VZDiskImageStorageDeviceAttachment(url: disk, readOnly: false))]
+        // Linux guests on virtio-blk with the automatic caching mode have a long record of ext4/btrfs
+        // I/O errors and corruption under write load (UTM #4840, fixed in UTM #5919 with .cached).
+        // Pin cached + full sync for Linux; macOS guests keep the framework defaults.
+        let rootDisk = saved.isLinux
+            ? try VZDiskImageStorageDeviceAttachment(url: disk, readOnly: false, cachingMode: .cached, synchronizationMode: .full)
+            : try VZDiskImageStorageDeviceAttachment(url: disk, readOnly: false)
+        var storage: [VZStorageDeviceConfiguration] = [VZVirtioBlockDeviceConfiguration(attachment: rootDisk)]
         if saved.isLinux {
             guard let identity = VZGenericMachineIdentifier(dataRepresentation: try Store.read(dir.appendingPathComponent("machine-identifier"))) else {
                 throw Failure("invalid_identity", "Invalid persisted machine identifier.")
