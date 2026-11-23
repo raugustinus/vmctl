@@ -12,7 +12,7 @@ func usage() {
                                 [--kernel /path/to/Image [--initrd /path/to/initrd] [--cmdline "<args>"]]
                                 [--share /path/to/project[:ro]]
            vmctl start [name] [--iso /path/to/installer.iso]
-           vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>]
+           vmctl start [name] --user <username> [--full-name <name>] [--ssh-key <key-or-file>] [--dns <ip>]
            vmctl logs [name] [--console [--follow]]
            vmctl stop [name] --force
            vmctl ssh-config [name] [--user <user>] [--host-key <key-or-file>] [--identity <private-key>]
@@ -30,6 +30,9 @@ func usage() {
     --ssh-key (Linux only) installs an OpenSSH public key; the account is then key-only with passwordless sudo.
     A Linux VM started with --user becomes <name>.vm in ~/.vmctl/ssh_config, with a pinned host key;
     see vmctl help ssh-config.
+    --dns (Linux only, with --user) makes the guest use that DNS server instead of the NAT gateway's.
+    vmd answers <name>.vm with a running VM's address on 127.0.0.1:\(NameService.port) (UDP); point a resolver's
+    vm zone at it, e.g. dnsmasq: server=/vm/127.0.0.1#\(NameService.port). See the README.
     Without --ssh-key the password is prompted securely on the terminal, never accepted as an argument.
     Default name: mac. stop waits up to 30 seconds for guest shutdown before forcing power-off.
     stop --force powers off immediately; unsaved guest data may be lost.
@@ -316,7 +319,7 @@ do {
     case "stop":
         if args == ["--force"] { forceStop = true } else if !args.isEmpty { throw Failure("usage", "Use vmctl stop [name] [--force].") }
     case "start":
-        var username: String?, fullName: String?, sshKey: String?
+        var username: String?, fullName: String?, sshKey: String?, dns: String?
         while !args.isEmpty {
             let flag = args.removeFirst()
             guard !args.isEmpty else { throw Failure("usage", "Missing value for \(flag).") }
@@ -331,13 +334,14 @@ do {
                 if value.hasSuffix(".pub"), !Provisioning.publicKeyTypes.contains(where: { value.hasPrefix($0 + " ") }) {
                     sshIdentityFile = String(absolute(value).dropLast(4))
                 }
+            case "--dns" where dns == nil: dns = value
             case "--iso" where installer == nil: installer = absolute(value)
-            default: throw Failure("usage", "Use start [name] [--iso <path>] [--user <username> [--full-name <name>] [--ssh-key <key>]]. Passwords must be entered at the prompt.")
+            default: throw Failure("usage", "Use start [name] [--iso <path>] [--user <username> [--full-name <name>] [--ssh-key <key>] [--dns <ip>]]. Passwords must be entered at the prompt.")
             }
         }
         if let username {
             // Validate the account before prompting so a bad name fails fast. Key-only accounts take no password.
-            try Provisioning(username: username, fullName: fullName ?? username, password: sshKey == nil ? "validation-placeholder" : nil, sshPublicKey: sshKey).validate()
+            try Provisioning(username: username, fullName: fullName ?? username, password: sshKey == nil ? "validation-placeholder" : nil, sshPublicKey: sshKey, dns: dns).validate()
             var password: String?
             if sshKey == nil {
                 password = try readPassword("New guest password: ")
@@ -346,9 +350,9 @@ do {
             // Linux guests generate the host's locale, so the LC_* variables ssh sends from this Mac are valid
             // there. macOS provisioning ignores it.
             provisioning = Provisioning(username: username, fullName: fullName ?? username, password: password, sshPublicKey: sshKey,
-                                        locale: Provisioning.hostLocale(ProcessInfo.processInfo.environment))
+                                        locale: Provisioning.hostLocale(ProcessInfo.processInfo.environment), dns: dns)
             try provisioning!.validate()
-        } else if fullName != nil || sshKey != nil { throw Failure("usage", "--full-name and --ssh-key require --user.") }
+        } else if fullName != nil || sshKey != nil || dns != nil { throw Failure("usage", "--full-name, --ssh-key and --dns require --user.") }
     default:
         if !args.isEmpty { throw Failure("usage", "Unexpected arguments.") }
     }

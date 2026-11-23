@@ -77,6 +77,34 @@ final class CloudInitTests: XCTestCase {
         XCTAssertEqual((readOnly["write_files"] as? [[String: Any]])?.last?["content"] as? String, "vmctl /home/dev/p virtiofs ro,nofail 0 0\n")
     }
 
+    func testDNSReplacesTheGatewayServer() throws {
+        func object(_ text: String) throws -> [String: Any] {
+            try XCTUnwrap(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+        }
+        let plain = try object(CloudInit.networkConfig(mac: "F6:12:32:EC:B2:F8"))
+        let plainNIC = try XCTUnwrap((plain["ethernets"] as? [String: Any])?["primary"] as? [String: Any])
+        XCTAssertNil(plainNIC["nameservers"]); XCTAssertNil(plainNIC["dhcp4-overrides"])
+
+        let set = try object(CloudInit.networkConfig(mac: "F6:12:32:EC:B2:F8", dns: "10.254.254.254"))
+        let nic = try XCTUnwrap((set["ethernets"] as? [String: Any])?["primary"] as? [String: Any])
+        XCTAssertEqual((nic["nameservers"] as? [String: [String]])?["addresses"], ["10.254.254.254"])
+        XCTAssertEqual((nic["dhcp4-overrides"] as? [String: Bool])?["use-dns"], false)
+        XCTAssertEqual((nic["match"] as? [String: String])?["macaddress"], "f6:12:32:ec:b2:f8")
+
+        // Router advertisements are turned off by a networkd drop-in on netplan's unit for "primary".
+        let account = Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key, dns: "10.254.254.254")
+        let userData = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(try CloudInit.userData(account, hostname: "lin").dropFirst("#cloud-config\n".count).utf8)) as? [String: Any])
+        let dropIn = try XCTUnwrap((userData["write_files"] as? [[String: Any]])?.first { ($0["path"] as? String)?.hasSuffix("50-vmctl-dns.conf") == true })
+        XCTAssertEqual(dropIn["path"] as? String, "/etc/systemd/network/10-netplan-primary.network.d/50-vmctl-dns.conf")
+        XCTAssertTrue((dropIn["content"] as? String)?.contains("[IPv6AcceptRA]\nUseDNS=no") == true)
+
+        XCTAssertNoThrow(try account.validate())
+        XCTAssertNoThrow(try Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key, dns: "fd00::53").validate())
+        for bad in ["dnsmasq.local", "10.254.254", "10.254.254.254; reboot", ""] {
+            XCTAssertThrowsError(try Provisioning(username: "dev", fullName: "Dev", password: nil, sshPublicKey: Self.key, dns: bad).validate(), bad)
+        }
+    }
+
     // Minimal FAT12 reader used only to verify what the writer produced.
     struct Entry { let name: String; let cluster: Int; let size: Int; let attributes: UInt8 }
     static func rootEntries(_ image: Data) -> [Entry] {

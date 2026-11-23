@@ -352,6 +352,9 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                         try store.writeKnownHosts(name: request.name, hostKey: hostKey.publicKey)
                         try writeSSHEntry(request.name, saved)
                     } else {
+                        guard credentials.dns == nil else {
+                            throw Failure("invalid_provisioning", "--dns applies to Linux VMs; macOS guests take DNS settings from System Settings.")
+                        }
                         guard credentials.sshPublicKey == nil, let password = credentials.password else {
                             throw Failure("invalid_provisioning", "macOS guests are provisioned with a password only; --ssh-key applies to Linux VMs.")
                         }
@@ -709,4 +712,10 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     }
     /// Cloud-init sets the guest hostname to the VM name, which is what the name fallback relies on.
     static func leaseIP(mac: String, name: String) -> String? { Leases.ip(mac: mac, hostname: name) }
+    /// The address `<name>.vm` resolves to: the lease of a running VM, as `vmctl ip` reports it.
+    func address(of name: String) -> String? {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let session = sessions[name], session.phase == "running", let mac = session.mac else { return nil }
+        return Self.leaseIP(mac: mac, name: name)
+    }
 }

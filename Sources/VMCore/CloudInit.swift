@@ -61,6 +61,13 @@ public enum CloudInit {
                 + "if [ -f /etc/locale.gen ] && ! grep -q '^\(locale) UTF-8' /etc/locale.gen; then echo '\(locale) UTF-8' >> /etc/locale.gen; fi; "
                 + "locale-gen \(locale))")
         }
+        if account.dns != nil {
+            // network-config sets the server and drops DHCPv4's. Router advertisements on the NAT bridge
+            // also name the host as a DNS server, and netplan has no switch for that, so a networkd
+            // drop-in on netplan's unit for the "primary" NIC turns it off.
+            writeFiles.append(["path": "/etc/systemd/network/10-netplan-primary.network.d/50-vmctl-dns.conf",
+                               "content": "[IPv6AcceptRA]\nUseDNS=no\n\n[DHCPv6]\nUseDNS=no\n"])
+        }
         if let share {
             user["uid"] = share.hostUID; config["users"] = [user]
             let mountPoint = "/home/\(account.username)/\(share.name)"
@@ -85,10 +92,14 @@ public enum CloudInit {
     /// Network config v2 for the VM's one NIC: DHCP, identified by its MAC. systemd-networkd
     /// otherwise sends a vendor DUID that contains no MAC, and the host's lease file then
     /// cannot be matched to the VM (`vmctl ip` would find nothing).
-    public static func networkConfig(mac: String) throws -> String {
-        let config: [String: Any] = ["version": 2, "ethernets": ["primary": [
-            "match": ["macaddress": mac.lowercased()], "dhcp4": true, "dhcp-identifier": "mac"
-        ]]]
+    /// With `dns`, the guest asks that server only, not the address DHCP hands out.
+    public static func networkConfig(mac: String, dns: String? = nil) throws -> String {
+        var nic: [String: Any] = ["match": ["macaddress": mac.lowercased()], "dhcp4": true, "dhcp-identifier": "mac"]
+        if let dns {
+            nic["nameservers"] = ["addresses": [dns]]
+            nic["dhcp4-overrides"] = ["use-dns": false]
+        }
+        let config: [String: Any] = ["version": 2, "ethernets": ["primary": nic]]
         let json = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys, .withoutEscapingSlashes])
         return String(decoding: json, as: UTF8.self) + "\n"
     }
@@ -96,7 +107,7 @@ public enum CloudInit {
         try FAT12.image(label: "CIDATA", files: [
             (name: "user-data", data: Data(try userData(account, hostname: hostname, share: share, hostKey: hostKey).utf8)),
             (name: "meta-data", data: Data(metaData(instanceID: "vmctl-\(hostname)-\(UUID().uuidString.lowercased())", hostname: hostname).utf8)),
-            (name: "network-config", data: Data(try networkConfig(mac: mac).utf8))
+            (name: "network-config", data: Data(try networkConfig(mac: mac, dns: account.dns).utf8))
         ])
     }
 

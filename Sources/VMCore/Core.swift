@@ -22,9 +22,17 @@ public struct Provisioning: Codable {
     /// Linux guests only: a UTF-8 locale such as `en_US.UTF-8` for cloud-init to generate and set,
     /// normally the host's own, so the `LC_*` variables macOS's ssh sends are valid in the guest.
     public let locale: String?
-    public init(username: String, fullName: String, password: String?, sshPublicKey: String? = nil, locale: String? = nil) {
+    /// Linux guests only: the one DNS server the guest uses, in place of the NAT gateway's
+    /// (192.168.64.1) from DHCP and router advertisements. An IPv4 or IPv6 address.
+    public let dns: String?
+    public init(username: String, fullName: String, password: String?, sshPublicKey: String? = nil, locale: String? = nil, dns: String? = nil) {
         self.username = username; self.fullName = fullName; self.password = password; self.sshPublicKey = sshPublicKey
-        self.locale = locale
+        self.locale = locale; self.dns = dns
+    }
+    /// True for a literal IPv4 or IPv6 address, the only form --dns accepts.
+    public static func isIPAddress(_ value: String) -> Bool {
+        var v4 = in_addr(), v6 = in6_addr()
+        return inet_pton(AF_INET, value, &v4) == 1 || inet_pton(AF_INET6, value, &v6) == 1
     }
     /// The host locale from `LC_ALL`, `LC_CTYPE` or `LANG`, if it is a plain UTF-8 locale
     /// cloud-init can generate. Anything else (`C`, `POSIX`, modifiers) yields nil.
@@ -59,6 +67,9 @@ public struct Provisioning: Codable {
         if let sshPublicKey { try Self.validatePublicKey(sshPublicKey) }
         if let locale, Self.validLocale(locale) != locale {
             throw Failure("invalid_provisioning", "Locale must look like en_US.UTF-8.")
+        }
+        if let dns, !Self.isIPAddress(dns) {
+            throw Failure("invalid_provisioning", "--dns takes one IPv4 or IPv6 address, such as 10.254.254.254.")
         }
     }
     /// Accepts one `type base64 [comment]` line whose wire blob names the same key type.

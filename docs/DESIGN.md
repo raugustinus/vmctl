@@ -55,6 +55,17 @@ A client timeout reports uncertainty, not cancellation: query `status` afterward
   baseline. The lease file is an undocumented host detail and may be missing or
   unreadable; then `ip_unknown` is returned. A lease is not proof that SSH is ready
   or that the guest has not changed its address.
+- Name service: vmd answers UDP DNS on `127.0.0.1:15353` for the `vm` zone only.
+  `<name>.vm` gets one A record, the address `ip` would report, TTL 5 s, while the
+  VM runs; other names in the zone get NXDOMAIN, other types an empty answer, and
+  anything outside the zone REFUSED, so it is never a general resolver. One question
+  per packet, no compression pointers, no recursion. Packet handling is a pure function
+  in VMCore (`NameService`), fuzzed in tests. Loopback only: guests and the host reach
+  it through a resolver on port 53 (dnsmasq `server=/vm/…`), which also caches. A busy
+  port disables it with a line on stderr; VMs are unaffected.
+- `start --user --dns <ip>`: the seed's network-config sets that server and
+  `dhcp4-overrides: use-dns: false`; a networkd drop-in on netplan's unit for the
+  `primary` NIC turns off DNS from router advertisements and DHCPv6.
 - `logs`: returns approximately the last 24 KiB of `logs/daemon.jsonl`, containing
   timestamped lifecycle events and framework failures. It is not guest console
   output and does not stream. Log rotation is not implemented.

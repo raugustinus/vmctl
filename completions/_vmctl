@@ -49,7 +49,8 @@ _vmctl() {
             '--iso[installer ISO for this boot]:ISO image:_files -g "*.(iso|ISO)(-.)"' \
             '--user[create this account on first boot]:account name:' \
             '--full-name[full name for --user]:full name:' \
-            '--ssh-key[public key, or a .pub file]:public key:_files -g "*.pub(-.)"' ;;
+            '--ssh-key[public key, or a .pub file]:public key:_files -g "*.pub(-.)"' \
+            '--dns[DNS server for the guest, with --user]:IP address:' ;;
         stop) _arguments '1:VM name:_vmctl_names' '--force[power off immediately]' ;;
         logs) _arguments '1:VM name:_vmctl_names' '--console[guest console output (hvc0)]' '--follow[keep printing new console output]' ;;
         status|ip|console|rm) _arguments '1:VM name:_vmctl_names' ;;

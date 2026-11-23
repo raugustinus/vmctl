@@ -11,6 +11,7 @@ _ = setsid()
 var retainedLock: Int32 = -1
 var retainedServer: Int32 = -1
 var supervisor: Supervisor!
+var nameServer: NameServer?
 var signalSources: [DispatchSourceSignal] = []
 let applicationDelegate = ConsoleApplicationDelegate()
 do {
@@ -35,6 +36,8 @@ do {
     }
     guard chmod(store.socketPath, 0o600) == 0, listen(retainedServer, 16) == 0 else { throw systemFailure("listen") }
     supervisor = Supervisor(store: store)
+    // <name>.vm on 127.0.0.1:15353, for a host resolver to forward the vm zone to.
+    nameServer = NameServer { supervisor.address(of: $0) }
     // Bound connections so a slow local client cannot grow an unlimited thread backlog.
     let slots = DispatchSemaphore(value: 16)
     let responses = DispatchQueue(label: "vmd.responses", attributes: .concurrent)

@@ -267,6 +267,57 @@ config (such as `Host *`) turns agent forwarding back on. VMs provisioned before
 this feature, and macOS guests, have no pinned key; `vmctl ssh-config <vm> --user dev
 --host-key <file>` adds one. Run `vmctl help ssh-config` for details.
 
+### Resolve `<name>.vm` everywhere (optional)
+
+The ssh_config entries only help `ssh`. For `curl proj.vm:8080`, a browser, or one
+guest reaching another, vmd also answers DNS for the `vm` zone: `<name>.vm` resolves to
+a running VM's address, the one `vmctl ip` reports, with a 5-second TTL. It listens on
+`127.0.0.1:15353` (UDP) only, answers nothing outside `vm`, and needs no setup inside vmctl.
+Something on port 53 has to forward to it; with Homebrew's dnsmasq:
+
+```sh
+# /opt/homebrew/etc/dnsmasq.d/vm.conf
+server=/vm/127.0.0.1#15353
+```
+
+Host lookups then need one resolver file (`sudo` once):
+
+```sh
+echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/vm
+```
+
+Guests use the NAT gateway (`192.168.64.1`) for DNS by default, and that is macOS's own
+DNS proxy, not dnsmasq. To send them to dnsmasq instead, give dnsmasq an address
+that always exists, a loopback alias, and provision with `--dns`:
+
+```sh
+vmctl start proj --user dev --ssh-key ~/.ssh/vm-proj.pub --dns 10.254.254.254
+```
+
+`--dns` sets that one server through cloud-init's network config and turns off the
+servers DHCP and IPv6 router advertisements name. Guests reach a loopback alias through
+the NAT, so dnsmasq never listens on your LAN.
+
+Why an alias, not `192.168.64.1`: the bridge and its address exist only while a VM
+runs. dnsmasq on macOS cannot bind an address or interface that appears after it
+starts (`bind-dynamic` and `hostsdir` reloading need Linux), and in wildcard mode it
+contends with mDNSResponder, which holds `*:53` while Internet Sharing is on. A
+LaunchDaemon that adds the alias at boot and then restarts dnsmasq:
+
+```xml
+<!-- /Library/LaunchDaemons/local.lo0-alias.plist, root:wheel 644 -->
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.lo0-alias</string>
+  <key>ProgramArguments</key><array>
+    <string>/bin/sh</string><string>-c</string>
+    <string>/sbin/ifconfig lo0 alias 10.254.254.254/32 &amp;&amp; /bin/launchctl kickstart -k system/sh.brew.dnsmasq</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+```
+
+with `interface=lo0` and `bind-interfaces` in `dnsmasq.conf`.
+
 ### Guest console log
 
 Every Linux VM has a virtio console (`hvc0`). The guest's output reaches the Mac
